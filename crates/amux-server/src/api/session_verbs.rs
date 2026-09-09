@@ -3690,6 +3690,62 @@ fn validate_model_name(value: &Value) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// The directories a SANDBOXED CLI must be able to write for git to work in `work_dir`.
+///
+/// Codex runs `--sandbox workspace-write`, which permits the workdir, /tmp and $TMPDIR and
+/// nothing else. Git in a WORKTREE writes outside all of those: the worktree's `.git` is a
+/// FILE pointing at `<main repo>/.git/worktrees/<name>`, and a commit also writes objects and
+/// refs in the shared `.git`. Without those granted, every git write fails with
+/// `Unable to create '.../index.lock': Operation not permitted` — measured, not inferred:
+/// a codex lane in a worktree could not commit at all, which is every dispatched worker and
+/// every reviewer on the codex stack.
+///
+/// This replaces two identical copies that asked `--show-toplevel` and then tested
+/// `<toplevel>/.git`.is_dir(). Both halves were wrong for exactly the case that needed them:
+/// in a worktree `--show-toplevel` IS the workdir (so the first grant was skipped as
+/// redundant), and `<worktree>/.git` is a file, so `is_dir()` was false and the second grant
+/// was skipped too. The intent was right and it could never fire where it mattered — it only
+/// ever worked for a plain clone, which did not need it.
+///
+/// `--git-common-dir` is the correct question: it resolves to the real shared `.git` for a
+/// worktree and to `<root>/.git` for a plain clone, so one code path covers both.
+async fn git_sandbox_dirs(work_dir: &str) -> Vec<String> {
+    let Some(gr) = run_cmd(
+        "git",
+        &["-C", work_dir, "rev-parse", "--path-format=absolute",
+          "--show-toplevel", "--git-common-dir"],
+        OP_TIMEOUT,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    if !gr.status.success() {
+        return Vec::new();          // not a repository, or git unavailable: grant nothing
+    }
+    let out = String::from_utf8_lossy(&gr.stdout);
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let root = lines.next().unwrap_or_default().to_string();
+    let common = lines.next().unwrap_or_default().to_string();
+    // Compare RESOLVED paths. On macOS /tmp and $TMPDIR live under a /private symlink, so git
+    // reports /private/var/... for a workdir handed to us as /var/... and a plain string
+    // comparison then re-grants the workdir the sandbox already allows.
+    let same = |a: &str, b: &str| {
+        std::fs::canonicalize(a).ok() == std::fs::canonicalize(b).ok()
+            || a == b
+    };
+    let mut dirs = Vec::new();
+    if !root.is_empty() && !same(&root, work_dir) {
+        dirs.push(root);
+    }
+    // A path that is not a directory is not grantable, and granting a stale one would widen
+    // the sandbox for nothing.
+    if !common.is_empty() && Path::new(&common).is_dir() {
+        dirs.push(common);
+    }
+    dirs
+}
+
 fn validate_effort(value: &Value) -> Result<String, String> {
     let Some(s) = value.as_str() else { return Err("effort must be a string".into()) };
     let normalized = s.trim().to_lowercase();
@@ -9316,16 +9372,9 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             if !opts.contains(&logs) {
                 opts += &format!(" --add-dir {}", sh_quote(&logs));
             }
-            if let Some(gr) = run_cmd("git", &["-C", &work_dir, "rev-parse", "--show-toplevel"], OP_TIMEOUT).await {
-                if gr.status.success() {
-                    let root = String::from_utf8_lossy(&gr.stdout).trim().to_string();
-                    if root != work_dir && !opts.contains(&root) {
-                        opts += &format!(" --add-dir {}", sh_quote(&root));
-                    }
-                    let git_dir = format!("{root}/.git");
-                    if Path::new(&git_dir).is_dir() && !opts.contains(&git_dir) {
-                        opts += &format!(" --add-dir {}", sh_quote(&git_dir));
-                    }
+            for dir in git_sandbox_dirs(&work_dir).await {
+                if !opts.contains(&dir) {
+                    opts += &format!(" --add-dir {}", sh_quote(&dir));
                 }
             }
             if !codex_session_id.is_empty() {
@@ -9442,16 +9491,9 @@ pub(crate) async fn start_session(state: &AppState, name: &str, extra_flags: &st
             if !opts.contains("model_reasoning_effort") {
                 opts += " -c model_reasoning_effort=low";
             }
-            if let Some(gr) = run_cmd("git", &["-C", &work_dir, "rev-parse", "--show-toplevel"], OP_TIMEOUT).await {
-                if gr.status.success() {
-                    let root = String::from_utf8_lossy(&gr.stdout).trim().to_string();
-                    if root != work_dir && !opts.contains(&root) {
-                        opts += &format!(" --add-dir {}", sh_quote(&root));
-                    }
-                    let git_dir = format!("{root}/.git");
-                    if Path::new(&git_dir).is_dir() && !opts.contains(&git_dir) {
-                        opts += &format!(" --add-dir {}", sh_quote(&git_dir));
-                    }
+            for dir in git_sandbox_dirs(&work_dir).await {
+                if !opts.contains(&dir) {
+                    opts += &format!(" --add-dir {}", sh_quote(&dir));
                 }
             }
             format!("{base_bin}{opts}")
@@ -22703,6 +22745,57 @@ mod tests {
         assert_eq!(observed["mode"], "provider-managed");
         assert_eq!(observed["measured"], true);
         assert_eq!(observed["pct_remaining"], 12);
+    }
+
+    /// THE CASE THE OLD CODE COULD NOT SEE. A git WORKTREE keeps its metadata in the main
+    /// repository, so a sandboxed CLI confined to the worktree cannot commit. The previous
+    /// implementation asked `--show-toplevel` (which in a worktree is the workdir itself) and
+    /// then tested `<workdir>/.git`.is_dir() (which in a worktree is a FILE) — so it granted
+    /// nothing in exactly the situation that needed a grant, and only ever worked for a plain
+    /// clone, which did not need it. Build a real worktree and require the SHARED git dir.
+    #[tokio::test]
+    async fn git_sandbox_dirs_grants_the_shared_dir_for_a_worktree() {
+        let tmp = std::env::temp_dir().join(format!("amux-gsd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // $TMPDIR is behind the /private symlink on macOS and git reports resolved paths;
+        // compare like with like rather than asserting against the unresolved spelling.
+        let tmp = std::fs::canonicalize(&tmp).unwrap();
+        let main = tmp.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let ok = std::process::Command::new("git")
+                .args(args).current_dir(cwd).output().unwrap();
+            assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+        };
+        git(&["init", "-q", "-b", "main"], &main);
+        git(&["config", "user.email", "t@t"], &main);
+        git(&["config", "user.name", "t"], &main);
+        git(&["commit", "-q", "--allow-empty", "-m", "root"], &main);
+
+        // A plain clone needs its own .git and nothing else; root == workdir so it is skipped.
+        let plain = git_sandbox_dirs(main.to_str().unwrap()).await;
+        let main_git = main.join(".git").to_string_lossy().into_owned();
+        assert_eq!(plain, vec![main_git.clone()], "plain repo grant changed");
+
+        let wt = tmp.join("wt");
+        git(&["worktree", "add", "--detach", "-q", wt.to_str().unwrap()], &main);
+        assert!(wt.join(".git").is_file(), "a worktree's .git must be a file for this test");
+        let dirs = git_sandbox_dirs(wt.to_str().unwrap()).await;
+        assert!(dirs.contains(&main_git),
+                "the shared git dir was not granted, so a sandboxed CLI cannot commit: {dirs:?}");
+        assert!(!dirs.contains(&wt.to_string_lossy().into_owned()),
+                "the workdir is already writable and must not be granted again: {dirs:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Not a repository must grant nothing rather than widening the sandbox on a guess.
+    #[tokio::test]
+    async fn git_sandbox_dirs_grants_nothing_outside_a_repository() {
+        let tmp = std::env::temp_dir().join(format!("amux-gsd-none-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(git_sandbox_dirs(tmp.to_str().unwrap()).await.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
