@@ -3746,21 +3746,138 @@ async fn git_sandbox_dirs(work_dir: &str) -> Vec<String> {
     dirs
 }
 
-fn validate_effort(value: &Value) -> Result<String, String> {
+/// How a provider spells REASONING EFFORT on its command line.
+///
+/// Claude takes `--effort <level>`. Codex has no such flag and rejects it outright —
+/// `error: unexpected argument '--effort' found` — configuring reasoning through
+/// `-c model_reasoning_effort=<level>` instead. amux wrote `--effort` for every provider,
+/// so asking for effort on a Codex lane launched `codex --model gpt-5.6-sol --effort medium`,
+/// codex died at argument parsing, and the lane was left as a bare shell that still looked
+/// like a member of the fleet (T22 #226; it killed reviewer-sol).
+///
+/// Keeping the spelling in one place is the point: the setter, the reader and the validator
+/// all ask this, so a provider cannot be handled in one of the three and missed in another.
+enum EffortSyntax {
+    /// `--effort high`
+    Flag(&'static str),
+    /// `-c model_reasoning_effort=high`
+    Config(&'static str),
+    /// The provider exposes no effort control; asking for one is an error, not a silent drop.
+    Unsupported,
+}
+
+fn effort_syntax(provider: &str) -> EffortSyntax {
+    match provider {
+        "claude" => EffortSyntax::Flag("--effort"),
+        // ollama runs through the codex binary (`codex --oss`), so it takes codex's spelling.
+        "codex" | "ollama" => EffortSyntax::Config("model_reasoning_effort"),
+        _ => EffortSyntax::Unsupported,
+    }
+}
+
+/// The levels a provider accepts. They are NOT the same set: `max` is Claude's and codex has
+/// no such level, while `minimal` is codex's and Claude has no such level. Codex does not
+/// validate this locally — it echoed `reasoning effort: bogus` back at us for a nonsense
+/// value — so a wrong level is not rejected at launch, it just quietly means nothing.
+fn effort_levels(provider: &str) -> &'static [&'static str] {
+    match effort_syntax(provider) {
+        EffortSyntax::Flag(_) => &VALID_EFFORTS,
+        EffortSyntax::Config(_) => &["minimal", "low", "medium", "high", "xhigh"],
+        EffortSyntax::Unsupported => &[],
+    }
+}
+
+/// Remove `-c key=...` / `--config key=...` pairs for one key, leaving other `-c` options
+/// alone. Stripping every `-c` would delete unrelated configuration.
+fn strip_config_kv(flags: &str, key: &str) -> Result<String, String> {
+    if flags.is_empty() {
+        return Ok(String::new());
+    }
+    let tokens = split_flags(flags)?;
+    let prefix = format!("{key}=");
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let t = &tokens[i];
+        if (t == "-c" || t == "--config")
+            && i + 1 < tokens.len()
+            && tokens[i + 1].starts_with(&prefix)
+        {
+            i += 2;
+            continue;
+        }
+        out.push(t.clone());
+        i += 1;
+    }
+    Ok(shell_quote_flags(&out.join(" ")))
+}
+
+/// Drop every spelling of effort, whatever provider wrote it.
+///
+/// Both, always — not just the current provider's. A provider swap rebuilds the flags and
+/// would otherwise carry the old provider's spelling across: swapping a Claude lane to Codex
+/// left `--effort high` in place and produced exactly the dead lane described above.
+fn strip_effort_flags(flags: &str) -> Result<String, String> {
+    let f = strip_token_from_flags(flags, "--effort")?;
+    strip_config_kv(&f, "model_reasoning_effort")
+}
+
+/// The effort currently written in `flags`, in this provider's spelling.
+fn read_effort(flags: &str, provider: &str) -> String {
+    match effort_syntax(provider) {
+        EffortSyntax::Flag(f) => flag_value(flags, f),
+        EffortSyntax::Config(key) => {
+            let Ok(tokens) = split_flags(flags) else { return String::new() };
+            let prefix = format!("{key}=");
+            tokens
+                .windows(2)
+                .find(|w| (w[0] == "-c" || w[0] == "--config") && w[1].starts_with(&prefix))
+                .map(|w| w[1][prefix.len()..].to_string())
+                .unwrap_or_default()
+        }
+        EffortSyntax::Unsupported => String::new(),
+    }
+}
+
+/// True when an effort change can be delivered to a LIVE agent instead of restarting it.
+/// `/effort <level>` is a Claude slash command; codex has no scriptable equivalent, so an
+/// effort change there costs a restart and must not claim otherwise.
+fn effort_is_hot_swappable(provider: &str) -> bool {
+    matches!(effort_syntax(provider), EffortSyntax::Flag(_))
+}
+
+fn validate_effort(value: &Value, provider: &str) -> Result<String, String> {
     let Some(s) = value.as_str() else { return Err("effort must be a string".into()) };
     let normalized = s.trim().to_lowercase();
-    if !normalized.is_empty() && !VALID_EFFORTS.contains(&normalized.as_str()) {
-        return Err(format!("invalid effort (allowed: {})", VALID_EFFORTS.join(", ")));
+    if normalized.is_empty() {
+        return Ok(normalized);          // reset-to-default is valid for every provider
+    }
+    let allowed = effort_levels(provider);
+    if allowed.is_empty() {
+        // Refuse rather than drop it. Accepting an effort the provider cannot express would
+        // report success for a setting that never reaches the agent.
+        return Err(format!("provider '{provider}' has no reasoning-effort control"));
+    }
+    if !allowed.contains(&normalized.as_str()) {
+        return Err(format!(
+            "invalid effort for provider '{provider}' (allowed: {})",
+            allowed.join(", ")
+        ));
     }
     Ok(normalized)
 }
 
-fn set_effort_flag(flags: &str, effort: &str) -> Result<String, String> {
-    let base = strip_token_from_flags(flags, "--effort")?;
+fn set_effort_flag(flags: &str, effort: &str, provider: &str) -> Result<String, String> {
+    let base = strip_effort_flags(flags)?;
     if effort.is_empty() {
         return Ok(base);
     }
-    Ok(if base.is_empty() { format!("--effort {effort}") } else { format!("{base} --effort {effort}") })
+    let token = match effort_syntax(provider) {
+        EffortSyntax::Flag(f) => format!("{f} {effort}"),
+        EffortSyntax::Config(key) => format!("-c {key}={effort}"),
+        EffortSyntax::Unsupported => return Ok(base),   // validate_effort already refused
+    };
+    Ok(if base.is_empty() { token } else { format!("{base} {token}") })
 }
 
 fn provider_yolo_flag(provider: &str) -> &'static str {
@@ -21141,12 +21258,33 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         };
         let was_yolo = is_yolo_enabled(&current_flags, &cfg);
         let flags_no_yolo = strip_provider_yolo_flags(&flags_no_model);
+        // EFFORT IS RE-EXPRESSED ACROSS A SWAP, NOT CARRIED. Each provider spells it
+        // differently, so keeping the old spelling hands the new binary an argument it does
+        // not know: swapping a Claude lane to Codex left `--effort high` in the flags and
+        // codex then died at argument parsing, leaving a lane that existed and could not
+        // run. Read the level in the OLD provider's spelling, then write it in the NEW one —
+        // and drop it when the new provider has no effort control at all.
+        let carried_effort = read_effort(&current_flags, &old_provider);
+        let flags_no_effort = match strip_effort_flags(&flags_no_yolo) {
+            Ok(v) => v,
+            Err(e) => {
+                return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("existing CC_FLAGS for session '{name}' is malformed ({e}); fix the .env file manually before updating the provider")}));
+            }
+        };
         let default_model = default_model_for_provider(&provider_val);
-        let mut flags = if flags_no_yolo.is_empty() {
+        let mut flags = if flags_no_effort.is_empty() {
             format!("--model {default_model}")
         } else {
-            format!("--model {default_model} {flags_no_yolo}")
+            format!("--model {default_model} {flags_no_effort}")
         };
+        if !carried_effort.is_empty() && effort_levels(&provider_val).contains(&carried_effort.as_str()) {
+            flags = match set_effort_flag(&flags, &carried_effort, &provider_val) {
+                Ok(v) => v,
+                Err(e) => {
+                    return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("could not carry effort across the provider swap for '{name}': {e}")}));
+                }
+            };
+        }
         if was_yolo {
             flags = format!("{flags} {}", provider_yolo_flag(&provider_val)).trim().to_string();
             cfg.set("CC_AUTO_CONTINUE", "1");
@@ -21180,7 +21318,8 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("existing CC_FLAGS for session '{name}' is malformed ({e}); fix the .env file manually before updating the model")}));
             }
         };
-        let old_effort = flag_value(cfg.get_or("CC_FLAGS", ""), "--effort");
+        let effort_provider = provider_of(&cfg);
+        let old_effort = read_effort(cfg.get_or("CC_FLAGS", ""), &effort_provider);
         let mut flags = if model_val.is_empty() {
             flags_no_model
         } else if flags_no_model.is_empty() {
@@ -21195,11 +21334,11 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         let mut expressible = !model_val.is_empty();
         cmds.push((format!("/model {model_val}"), CC_MODEL_ACK));
         if let Some(ev) = body.get("effort") {
-            let effort_val = match validate_effort(ev) {
+            let effort_val = match validate_effort(ev, &effort_provider) {
                 Ok(v) => v,
                 Err(e) => return jresp(StatusCode::BAD_REQUEST, json!({"error": e})),
             };
-            flags = match set_effort_flag(&flags, &effort_val) {
+            flags = match set_effort_flag(&flags, &effort_val, &effort_provider) {
                 Ok(v) => v,
                 Err(e) => {
                     return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("existing CC_FLAGS for session '{name}' is malformed ({e}); fix the .env file manually before updating effort")}));
@@ -21213,7 +21352,10 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
             // would make the whole change inexpressible and force a restart on
             // every model swap from the picker.
             if effort_val != old_effort {
-                if effort_val.is_empty() {
+                // `/effort` is a Claude slash command. On a provider without one the change
+                // is real but cannot be delivered hot, so it must force the restart rather
+                // than be reported as applied to a live agent that never heard it.
+                if effort_val.is_empty() || !effort_is_hot_swappable(&effort_provider) {
                     expressible = false;
                 } else {
                     cmds.push((format!("/effort {effort_val}"), CC_EFFORT_ACK));
@@ -21268,18 +21410,18 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
 
     // Change effort only (py:76570).
     if let Some(ev) = body.get("effort") {
-        let effort_val = match validate_effort(ev) {
+        let current_provider = provider_of(&cfg);
+        let effort_val = match validate_effort(ev, &current_provider) {
             Ok(v) => v,
             Err(e) => return jresp(StatusCode::BAD_REQUEST, json!({"error": e})),
         };
-        let flags = match set_effort_flag(cfg.get_or("CC_FLAGS", ""), &effort_val) {
+        let flags = match set_effort_flag(cfg.get_or("CC_FLAGS", ""), &effort_val, &current_provider) {
             Ok(v) => v,
             Err(e) => {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": format!("existing CC_FLAGS for session '{name}' is malformed ({e}); fix the .env file manually before updating effort")}));
             }
         };
         cfg.set("CC_FLAGS", &flags);
-        let current_provider = provider_of(&cfg);
         let was_running = running;
         if let Err((status, error)) = write_swap_config(state, name, &cfg, was_running, "effort change") {
             return jresp(status, json!({"error": error}));
@@ -21288,14 +21430,16 @@ async fn config_patch_with_liveness(state: &AppState, name: &str, body: &Value, 
         // (verified 2026-08-09: "Set effort level to high (saved as your
         // default for new sessions)"), so an effort change costs no restart
         // either. Reset-to-default has no argument form, so it does.
-        let cmds: Vec<(String, &'static str)> = if effort_val.is_empty() {
-            Vec::new()
-        } else {
+        // Hot only where the provider actually has the slash command; elsewhere this is a
+        // restart, and saying so is the difference between an applied change and a claimed one.
+        let hot = !effort_val.is_empty() && effort_is_hot_swappable(&current_provider);
+        let cmds: Vec<(String, &'static str)> = if hot {
             vec![(format!("/effort {effort_val}"), CC_EFFORT_ACK)]
+        } else {
+            Vec::new()
         };
         let rep = apply_live_config_change(
-            state, name, &current_provider, was_running, &cmds, !effort_val.is_empty(),
-            "effort change",
+            state, name, &current_provider, was_running, &cmds, hot, "effort change",
         )
         .await;
         let shown = if effort_val.is_empty() { "default".to_string() } else { effort_val };
@@ -25826,6 +25970,97 @@ mod tests {
                 "a shell prompt was read as an agent composer");
     }
 
+    /// EFFORT IS SPELLED PER PROVIDER (T22 #226).
+    ///
+    /// amux wrote `--effort <level>` for every provider. Codex has no such flag and rejects
+    /// it — `error: unexpected argument '--effort' found` — so asking for effort on a codex
+    /// lane launched a binary that died at argument parsing and left a bare shell still
+    /// listed as a member of the fleet. That killed reviewer-sol.
+    #[test]
+    fn effort_is_written_in_each_provider_s_own_spelling() {
+        assert_eq!(set_effort_flag("--model opus", "high", "claude").unwrap(),
+                   "--model opus --effort high");
+        let codex = set_effort_flag("--model gpt-5.6-sol", "medium", "codex").unwrap();
+        assert_eq!(codex, "--model gpt-5.6-sol -c model_reasoning_effort=medium");
+        assert!(!codex.contains("--effort"), "codex must never be handed --effort: {codex}");
+        // ollama runs through the codex binary and takes the same spelling.
+        assert!(set_effort_flag("--model qwen", "low", "ollama").unwrap()
+                    .contains("-c model_reasoning_effort=low"));
+    }
+
+    #[test]
+    fn effort_round_trips_through_the_reader_for_both_spellings() {
+        for (provider, level) in [("claude", "xhigh"), ("codex", "high"), ("ollama", "minimal")] {
+            let f = set_effort_flag("--model m", level, provider).unwrap();
+            assert_eq!(read_effort(&f, provider), level, "{provider}: {f}");
+        }
+        // A reader must not find the OTHER provider's spelling and report it as its own.
+        let claude_flags = set_effort_flag("--model opus", "high", "claude").unwrap();
+        assert_eq!(read_effort(&claude_flags, "codex"), "");
+    }
+
+    #[test]
+    fn setting_effort_replaces_the_other_spelling_rather_than_stacking() {
+        // A lane that already carries the wrong spelling (every codex lane did) must come out
+        // with exactly one, or codex still sees the argument that kills it.
+        let stale = "--model gpt-5.6-sol --effort medium";
+        let fixed = set_effort_flag(stale, "high", "codex").unwrap();
+        assert!(!fixed.contains("--effort"), "{fixed}");
+        assert_eq!(fixed.matches("model_reasoning_effort").count(), 1, "{fixed}");
+        // Clearing removes every spelling, whoever wrote it.
+        assert_eq!(set_effort_flag(stale, "", "codex").unwrap(), "--model gpt-5.6-sol");
+
+        // AND THE PROVIDER'S OWN SPELLING IS REPLACED, NOT APPENDED. Changing effort twice on
+        // one codex lane is the ordinary case, and stripping only the other provider's form
+        // leaves both values on the command line for codex to pick between. The first version
+        // of this test missed it by starting from a stale CLAUDE flag, which the narrower
+        // strip still removed — green for the wrong reason.
+        let once = set_effort_flag("--model gpt-5.6-sol", "low", "codex").unwrap();
+        let twice = set_effort_flag(&once, "high", "codex").unwrap();
+        assert_eq!(twice.matches("model_reasoning_effort").count(), 1, "{twice}");
+        assert!(twice.contains("model_reasoning_effort=high") && !twice.contains("=low"), "{twice}");
+        assert_eq!(read_effort(&twice, "codex"), "high");
+
+        // Symmetrically for claude, so neither direction relies on the other's coverage.
+        let c1 = set_effort_flag("--model opus", "low", "claude").unwrap();
+        let c2 = set_effort_flag(&c1, "max", "claude").unwrap();
+        assert_eq!(c2.matches("--effort").count(), 1, "{c2}");
+        assert_eq!(read_effort(&c2, "claude"), "max");
+    }
+
+    #[test]
+    fn stripping_effort_config_leaves_other_config_options_alone() {
+        let f = "-c foo=1 -c model_reasoning_effort=high -c bar=2";
+        let out = strip_config_kv(f, "model_reasoning_effort").unwrap();
+        assert!(out.contains("foo=1") && out.contains("bar=2"), "{out}");
+        assert!(!out.contains("model_reasoning_effort"), "{out}");
+    }
+
+    #[test]
+    fn effort_levels_are_validated_against_the_provider_that_will_receive_them() {
+        // `max` is Claude's and codex has no such level; `minimal` is codex's and Claude has
+        // none. Codex does not validate locally — it echoed back `reasoning effort: bogus` —
+        // so a level nobody checks is a level that silently means nothing.
+        assert!(validate_effort(&json!("max"), "claude").is_ok());
+        assert!(validate_effort(&json!("max"), "codex").is_err());
+        assert!(validate_effort(&json!("minimal"), "codex").is_ok());
+        assert!(validate_effort(&json!("minimal"), "claude").is_err());
+        // A provider with no effort control REFUSES rather than reporting success for a
+        // setting that never reaches the agent.
+        assert!(validate_effort(&json!("high"), "muse").is_err());
+        // Reset-to-default stays valid everywhere.
+        assert_eq!(validate_effort(&json!(""), "muse").unwrap(), "");
+    }
+
+    #[test]
+    fn only_a_provider_with_the_slash_command_swaps_effort_hot() {
+        // `/effort` is a Claude command. Claiming a hot apply on codex would report a change
+        // as delivered to a live agent that never heard it.
+        assert!(effort_is_hot_swappable("claude"));
+        assert!(!effort_is_hot_swappable("codex"));
+        assert!(!effort_is_hot_swappable("muse"));
+    }
+
     #[test]
     fn env_file_roundtrip_preserves_order_and_quotes() {
         let dir = tempfile::tempdir().unwrap();
@@ -25862,9 +26097,11 @@ mod tests {
         assert_eq!(extract_model_from_flags(&f), "claude-opus-4-6[1m]");
         // Unbalanced quote errs (never silently wipes flags).
         assert!(strip_model_from_flags("--model 'oops").is_err());
-        // effort set/clear.
-        assert_eq!(set_effort_flag("--model opus", "high").unwrap(), "--model opus --effort high");
-        assert_eq!(set_effort_flag("--model opus --effort low", "").unwrap(), "--model opus");
+        // effort set/clear (claude spelling).
+        assert_eq!(set_effort_flag("--model opus", "high", "claude").unwrap(),
+                   "--model opus --effort high");
+        assert_eq!(set_effort_flag("--model opus --effort low", "", "claude").unwrap(),
+                   "--model opus");
         // yolo strip covers --approval-mode yolo.
         assert_eq!(strip_provider_yolo_flags("--yolo --model auto"), "--model auto");
         assert_eq!(strip_provider_yolo_flags("--approval-mode yolo -x"), "-x");
@@ -26691,6 +26928,51 @@ CLAUDE-POSTFIX-COMPLETE
         assert!(prompt.contains("amux board show <ID> --messages") && prompt.contains("only a preview"), "captured assignments must recover their untruncated source: {prompt}");
         assert!(!prompt.contains(".amux/logs"), "{prompt}");
         assert!(!prompt.contains("terminal history"), "{prompt}");
+    }
+
+    /// A PROVIDER SWAP MUST TRANSLATE EFFORT, NOT CARRY IT.
+    ///
+    /// The rebuild kept whatever effort spelling was already in the flags, so swapping a
+    /// Claude lane to Codex left `--effort high` in place — and codex dies at argument
+    /// parsing on that, leaving a lane that exists and cannot run. This is the same defect as
+    /// #226 reached by a different door, which is why it needs its own test: fixing the
+    /// setter alone would leave this path still producing dead lanes.
+    #[tokio::test]
+    async fn a_provider_swap_re_expresses_effort_instead_of_carrying_the_old_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(sessions_dir()).unwrap();
+        let (state, _store_dir) = state();
+
+        let name = "swap-effort";
+        std::fs::write(
+            env_path(name),
+            format!("CC_PROVIDER=claude\nCC_FLAGS=--model opus --effort high\nCC_DIR={}\n",
+                    dir.path().display()),
+        )
+        .unwrap();
+        let resp = config_patch_with_liveness(&state, name, &json!({"provider": "codex"}), false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let flags = parse_env(name).get_or("CC_FLAGS", "").to_string();
+        assert!(!flags.contains("--effort"),
+                "codex was handed the argument that kills it: {flags}");
+        assert!(flags.contains("-c model_reasoning_effort=high"),
+                "the level was dropped instead of translated: {flags}");
+
+        // And a provider with NO effort control keeps neither spelling, rather than carrying
+        // one it cannot use.
+        let name2 = "swap-effort-none";
+        std::fs::write(
+            env_path(name2),
+            format!("CC_PROVIDER=claude\nCC_FLAGS=--model opus --effort high\nCC_DIR={}\n",
+                    dir.path().display()),
+        )
+        .unwrap();
+        let resp2 = config_patch_with_liveness(&state, name2, &json!({"provider": "muse"}), false).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let flags2 = parse_env(name2).get_or("CC_FLAGS", "").to_string();
+        assert!(!flags2.contains("--effort") && !flags2.contains("model_reasoning_effort"),
+                "an effort the provider cannot express was carried anyway: {flags2}");
     }
 
     #[tokio::test]
