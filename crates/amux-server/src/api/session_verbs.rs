@@ -1058,8 +1058,16 @@ fn is_prompt_line(s: &str) -> bool {
     s.chars().next().map(|c| PROMPT_GLYPHS.contains(&c)).unwrap_or(false)
 }
 
-/// py:8229 _claude_ui_visible (claude + codex + gemini markers).
-fn claude_ui_visible(clean_output: &str) -> bool {
+/// py:8229 _claude_ui_visible (claude + codex + gemini + muse markers).
+/// Is an AGENT's composer up in this pane — for ANY provider, not just Claude.
+///
+/// The name said claude and the body already answered for codex too, which is how muse got
+/// missed: nothing about `claude_ui_visible` invites you to add a provider to it. Muse then
+/// never read as ready, and `send_after_ready` polled for its whole 60s timeout and DROPPED
+/// the start/wake prompt — measured on worker-muse, twice in one minute, logged as "Claude UI
+/// never became ready" on a lane that runs no Claude. Renamed so the next provider added to
+/// amux is a grep away from this function instead of a silent timeout.
+fn agent_ui_visible(clean_output: &str) -> bool {
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
     let shell_prompt = cached_re!(r"^.*[$%]\s");
     let n = lines.len();
@@ -1090,6 +1098,13 @@ fn claude_ui_visible(clean_output: &str) -> bool {
             && (ls.contains("full-auto") || ls.contains("suggest") || ls.contains("workspace")
                 || ls.contains("approval") || ls.contains("-a never"))
         {
+            return true;
+        }
+        // Muse Code. Its composer frame prints the voice-input hint and its footer is
+        // "<model> · <effort> · <cwd>"; both are present the moment the TUI is up and no
+        // shell prints either. The model prefix is the second marker rather than the only
+        // one because a model rename would silently take the check with it.
+        if ls.contains("voice input") || ls.contains("muse-spark") {
             return true;
         }
     }
@@ -1156,7 +1171,7 @@ fn at_resume_picker(clean_output: &str) -> bool {
 
 /// py:8307 _at_shell_prompt.
 fn at_shell_prompt(clean_output: &str) -> bool {
-    if claude_ui_visible(clean_output) {
+    if agent_ui_visible(clean_output) {
         return false;
     }
     let lines: Vec<&str> = clean_output.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -7079,7 +7094,7 @@ async fn send_after_ready(
         let out = tmux_capture(&name, 15).await;
         if !out.is_empty() {
             let clean = strip_ansi(&out);
-            if claude_ui_visible(&clean) && !at_resume_picker(&clean) {
+            if agent_ui_visible(&clean) && !at_resume_picker(&clean) {
                 sleep_ms(1200).await;
                 let _ = send_text_boxed(&state, &name, &text, false, origin).await;
                 return;
@@ -7098,7 +7113,12 @@ async fn send_after_ready(
         session = %name,
         timeout_s,
         chars = text.chars().count(),
-        "send_after_ready: Claude UI never became ready before timeout; start/wake prompt DROPPED undelivered"
+        // Name the PROVIDER, not "Claude". This line said "Claude UI" on a muse lane, which
+        // reads as a launch bug — the Producer reported it as amux having started Claude for
+        // a provider=muse lane. It had not; the readiness predicate simply knew no muse
+        // markers. A message that misnames what it watched sends the next reader after the
+        // wrong defect.
+        "send_after_ready: agent UI never became ready before timeout; start/wake prompt DROPPED undelivered"
     );
     emit_event(
         &state,
@@ -8968,7 +8988,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         let out = tmux_capture(name, 10).await;
         if !out.is_empty() {
             let clean = strip_ansi(&out);
-            if claude_ui_visible(&clean) {
+            if agent_ui_visible(&clean) {
                 launched = true;
                 break;
             }
@@ -9041,7 +9061,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             for _ in 0..10 {
                 sleep_ms(500).await;
                 let o = strip_ansi(&tmux_capture(name, 10).await);
-                if claude_ui_visible(&o) {
+                if agent_ui_visible(&o) {
                     launched = true;
                     break;
                 }
@@ -9076,7 +9096,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             for _ in 0..10 {
                 sleep_ms(500).await;
                 let out2 = tmux_capture(name, 10).await;
-                if !out2.is_empty() && claude_ui_visible(&strip_ansi(&out2)) {
+                if !out2.is_empty() && agent_ui_visible(&strip_ansi(&out2)) {
                     launched = true;
                     break;
                 }
@@ -9123,7 +9143,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             for _ in 0..20 {
                 sleep_ms(500).await;
                 let o2 = strip_ansi(&tmux_capture(name, 10).await);
-                if claude_ui_visible(&o2) {
+                if agent_ui_visible(&o2) {
                     relaunched = true;
                     break;
                 }
@@ -23516,6 +23536,41 @@ mod tests {
     /// it — `error: unexpected argument '--effort' found` — so asking for effort on a codex
     /// lane launched a binary that died at argument parsing and left a bare shell still
     /// listed as a member of the fleet. That killed reviewer-sol.
+    /// EVERY PROVIDER'S COMPOSER MUST READ AS READY, not just Claude's.
+    ///
+    /// `send_after_ready` waits for this predicate and DROPS the start/wake prompt when it
+    /// never fires. Muse had no markers here, so a muse lane timed out and lost its prompt —
+    /// observed twice on worker-muse — while the log said "Claude UI never became ready" on a
+    /// lane running no Claude, which is what made it look like a launch bug.
+    #[test]
+    fn every_provider_s_composer_reads_as_ready() {
+        // Real captures, ANSI already stripped.
+        let muse = "── Voice input (\u{2325} + v to start) ──────────────\n\
+                    \u{27e9}\n\
+                    ──────────────────────────────────────────────\n\
+                    muse-spark-1.3-contributor \u{b7} high \u{b7} ~/.amux/worktrees/obrist/worker-muse";
+        assert!(agent_ui_visible(muse), "muse composer not recognised:\n{muse}");
+        // The two muse markers must work INDEPENDENTLY, or the pair is decoration: with both
+        // in one sample the suite stays green after either is deleted. The footer alone
+        // covers a muse build that drops the voice hint; the composer frame alone covers the
+        // model being renamed, which is the likelier of the two.
+        let footer_only = "  muse-spark-1.3-contributor \u{b7} high \u{b7} ~/w";
+        assert!(agent_ui_visible(footer_only), "footer marker does not stand alone");
+        let frame_only = "── Voice input (\u{2325} + v to start) ──\n\u{27e9}\n  future-model-name \u{b7} high \u{b7} ~/w";
+        assert!(agent_ui_visible(frame_only), "composer frame does not stand alone");
+
+        let codex = "\u{203a} Ask Codex to do anything\n\
+                     gpt-5.6-sol default \u{b7} ~/.amux/worktrees/obrist/reviewer-sol";
+        assert!(agent_ui_visible(codex), "codex composer not recognised");
+
+        let claude = "\u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} \u{2190} for agents";
+        assert!(agent_ui_visible(claude), "claude composer not recognised");
+
+        // A bare shell is still NOT ready — otherwise the prompt is typed into a shell.
+        assert!(!agent_ui_visible("slopmachine@Alexeys-Mini worker-muse % "),
+                "a shell prompt was read as an agent composer");
+    }
+
     #[test]
     fn effort_is_written_in_each_provider_s_own_spelling() {
         assert_eq!(set_effort_flag("--model opus", "high", "claude").unwrap(),
@@ -23738,7 +23793,7 @@ mod tests {
     #[test]
     fn detectors_read_real_frames() {
         let claude_idle = "some output\n\u{276f} \n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
-        assert!(claude_ui_visible(claude_idle));
+        assert!(agent_ui_visible(claude_idle));
         assert!(!at_shell_prompt(claude_idle));
         // AMUX-3055: the DEFAULT footer (no --dangerously-skip-permissions) is
         // "manual mode on · ? for shortcuts", NOT the bypass footer. This frame
@@ -23746,10 +23801,10 @@ mod tests {
         // the old detector, so send_after_ready dropped its start prompt. The
         // assertion fails against that old detector, which is the point.
         let claude_manual = "some output\n\u{276f} Try \"fix typecheck errors\"\n────\n⏸ manual mode on · ? for shortcuts · ← 2 agents";
-        assert!(claude_ui_visible(claude_manual), "manual-mode idle UI must read as visible");
+        assert!(agent_ui_visible(claude_manual), "manual-mode idle UI must read as visible");
         assert!(!at_shell_prompt(claude_manual));
         let shell = "Last login: Sat\nmixpeek$ ";
-        assert!(!claude_ui_visible(shell));
+        assert!(!agent_ui_visible(shell));
         assert!(at_shell_prompt(shell));
         // Spinner = active; prompt-glyph lines never count as chrome.
         let active = "\u{273b} Crunching\u{2026} (12s)\n\u{276f} typed text";
