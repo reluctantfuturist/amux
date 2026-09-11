@@ -11516,6 +11516,16 @@ pub(crate) fn steer_max_age_s() -> f64 {
         .unwrap_or(600.0)
 }
 
+/// Absolute bound for the stronger background-work hold. A lost or hung
+/// child must not suppress every queued callback forever.
+pub(crate) fn steer_background_max_age_s() -> f64 {
+    std::env::var("AMUX_STEER_BACKGROUND_MAX_AGE_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(3600.0)
+}
+
 /// Grace before a permanently-unroutable steering row is dead-lettered
 /// (AMUX-3110). One hour, not the 600s delivery deadline: the deadline is
 /// about a LIVE lane being slow to reach a turn boundary, this is about a
@@ -11616,15 +11626,17 @@ pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_
 /// max-age escape deliberately hands an old message to the provider while a
 /// long foreground turn continues; doing that while the provider says a
 /// background child is live interrupted the parent conversation and killed the
-/// very work status was protecting. Only the terminal edge clears this hold.
+/// very work status was protecting. Give that work a longer hold, but bound it:
+/// a lost background process otherwise makes every callback undeliverable forever.
 fn steer_decide_with_background(
     reported: Option<&str>,
     pane_idle: Option<bool>,
     age_s: f64,
     max_age_s: f64,
+    background_max_age_s: f64,
     background_working: bool,
 ) -> SteerDelivery {
-    if background_working {
+    if background_working && age_s < background_max_age_s {
         SteerDelivery::Hold
     } else {
         steer_decide(reported, pane_idle, age_s, max_age_s)
@@ -11881,7 +11893,8 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
         if let Some(raw) = signals.panes.get(name) { warn_background_override_once(name, raw); }
     }
     steer_decide_with_background(
-        Some(&status), None, age_s, steer_max_age_s(), background_working,
+        Some(&status), None, age_s, steer_max_age_s(), steer_background_max_age_s(),
+        background_working,
     )
 }
 
@@ -27491,9 +27504,14 @@ mod steer_freeze_tests {
         );
         assert!(!pane_is_at_boundary(CODEX_BACKGROUND_TERMINAL));
         assert_eq!(
-            steer_decide_with_background(Some("active"), None, 86_400.0, 600.0, true),
+            steer_decide_with_background(Some("active"), None, 3_599.0, 600.0, 3_600.0, true),
             SteerDelivery::Hold,
-            "max age never authorizes interruption while background work is live"
+            "background work gets a stronger hold before its absolute deadline"
+        );
+        assert_eq!(
+            steer_decide_with_background(Some("active"), None, 3_601.0, 600.0, 3_600.0, true),
+            SteerDelivery::OverdueMidTurn,
+            "a lost background child cannot suppress the steering queue forever"
         );
 
         assert!(!provider_background_working(CODEX_BACKGROUND_FINISHED));
@@ -27515,7 +27533,7 @@ mod steer_freeze_tests {
             "ordinary Codex foreground work is not relabelled as a background terminal"
         );
         assert_eq!(
-            steer_decide_with_background(Some("active"), None, 601.0, 600.0, false),
+            steer_decide_with_background(Some("active"), None, 601.0, 600.0, 3_600.0, false),
             SteerDelivery::OverdueMidTurn,
             "the pre-existing max-age policy remains available for ordinary foreground work"
         );
