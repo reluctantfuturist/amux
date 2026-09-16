@@ -378,6 +378,56 @@ const MIGRATIONS: &[Migration] = &[
         name: "0064_steering_delivery_claim",
         sql: include_str!("../../migrations/0064_steering_delivery_claim.sql"),
     },
+    Migration {
+        version: 65,
+        name: "0065_interaction_receipts",
+        sql: include_str!("../../migrations/0065_interaction_receipts.sql"),
+    },
+    Migration {
+        version: 66,
+        name: "0066_send_receipt_identity",
+        sql: include_str!("../../migrations/0066_send_receipt_identity.sql"),
+    },
+    Migration {
+        version: 67,
+        name: "0067_message_capture_pending",
+        sql: include_str!("../../migrations/0067_message_capture_pending.sql"),
+    },
+    Migration {
+        version: 68,
+        name: "0068_task_lease",
+        sql: include_str!("../../migrations/0068_task_lease.sql"),
+    },
+    Migration {
+        version: 69,
+        name: "0069_worker_lifecycle",
+        sql: include_str!("../../migrations/0069_worker_lifecycle.sql"),
+    },
+    Migration {
+        version: 70,
+        name: "0070_token_ledger_message_id",
+        sql: include_str!("../../migrations/0070_token_ledger_message_id.sql"),
+    },
+    Migration {
+        version: 71,
+        name: "0071_issues_epic_index",
+        sql: include_str!("../../migrations/0071_issues_epic_index.sql"),
+    },
+    Migration {
+        version: 72,
+        name: "0072_host_metrics",
+        sql: include_str!("../../migrations/0072_host_metrics.sql"),
+    },
+    Migration {
+        version: 73,
+        name: "0073_command_intake",
+        sql: include_str!("../../migrations/0073_command_intake.sql"),
+    },
+    Migration {
+        version: 74,
+        name: "0074_cmd_history_client_meta",
+        sql: include_str!("../../migrations/0074_cmd_history_client_meta.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

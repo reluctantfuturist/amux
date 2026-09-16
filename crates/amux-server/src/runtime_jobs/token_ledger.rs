@@ -47,7 +47,7 @@ fn model_is_skipped(model: &str) -> bool {
     model.is_empty() || model == "<synthetic>"
 }
 
-fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
+pub(crate) fn prices(home: &Path) -> Vec<(String, [f64; 4])> {
     let mut table: Vec<(String, [f64; 4])> = MODEL_PRICES_DEFAULT
         .iter()
         .map(|(k, v)| ((*k).to_string(), *v))
@@ -98,7 +98,20 @@ fn price_for_model(table: &[(String, [f64; 4])], model: &str) -> [f64; 4] {
         .unwrap_or(PRICE_DEFAULT)
 }
 
-fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 {
+/// Does the price table actually name this model?
+///
+/// AMUX-4583: `price_for_model` falls back to PRICE_DEFAULT on purpose, because
+/// a zero reads as a free turn. That is right for a new Claude model and wrong
+/// for a different vendor: applying Claude rates to codex turns put $5,654 of
+/// cost in the ledger that nobody spent. The fallback stays; the COUNT of rows
+/// that took it is now reportable, so a guessed dollar figure cannot pass as a
+/// measured one.
+pub(crate) fn model_is_priced(table: &[(String, [f64; 4])], model: &str) -> bool {
+    let m = model.to_lowercase();
+    table.iter().any(|(k, _)| m.contains(k.as_str()))
+}
+
+pub(crate) fn turn_cost_usd(table: &[(String, [f64; 4])], model: &str, t: [i64; 4]) -> f64 {
     let p = price_for_model(table, model);
     (t[0] as f64 * p[0] + t[1] as f64 * p[1] + t[2] as f64 * p[2] + t[3] as f64 * p[3])
         / 1_000_000.0
@@ -144,7 +157,17 @@ struct Turn {
     model: String,
     tokens: [i64; 4],
     cost: f64,
+    /// `message.id` of the API response this usage belongs to (AMUX-4580).
+    /// The key that makes billing exact; None only for lines that carry no id.
+    message_id: Option<String>,
+    request_id: Option<String>,
 }
+
+/// Usage lines dropped because their `message.id` was already billed in the
+/// same pass, process-lifetime (AMUX-4580). Published beside the insert count so
+/// a subagent-heavy day shows how much double billing the key prevented.
+pub static LEDGER_DUPLICATE_MESSAGES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Parse one JSONL from `offset` onward. Returns the new offset and the turns.
 ///
@@ -169,6 +192,8 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
     let mut new_off = offset;
     let mut out = Vec::new();
     let mut prev_sig: Option<(i64, i64, i64)> = None;
+    // AMUX-4580: responses already billed in this pass, by message id.
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in BufReader::new(f).split(b'\n') {
         let Ok(mut bytes) = raw else { break };
         // `split` strips the delimiter; the cursor must still count it or every
@@ -199,11 +224,26 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
             g("cache_creation_input_tokens"),
             g("output_tokens"),
         ];
-        let sig = (tokens[0], tokens[1], tokens[3]);
-        if prev_sig == Some(sig) {
-            continue;
+        // KEYED BY THE RESPONSE WHEN THE TRANSCRIPT NAMES IT (AMUX-4580). One
+        // API response's usage is repeated for its thinking, text and tool_use
+        // parts, and in subagent transcripts not always on adjacent lines, so
+        // the adjacent signature below missed the repeats and billed one
+        // response several times. The id cannot merge two real turns: they have
+        // different ids even when their counts match. Lines without an id keep
+        // the adjacent-signature rule, which is still right for them.
+        let message_id = msg["id"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        if let Some(id) = message_id.as_deref() {
+            if !seen_ids.insert(id.to_string()) {
+                LEDGER_DUPLICATE_MESSAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+        } else {
+            let sig = (tokens[0], tokens[1], tokens[3]);
+            if prev_sig == Some(sig) {
+                continue;
+            }
+            prev_sig = Some(sig);
         }
-        prev_sig = Some(sig);
         if tokens.iter().sum::<i64>() == 0 {
             continue;
         }
@@ -219,6 +259,8 @@ fn parse_from(path: &Path, offset: u64, fallback_ts: i64, owner: &str, table: &[
             model: model.clone(),
             tokens,
             cost: turn_cost_usd(table, &model, tokens),
+            message_id,
+            request_id: e["requestId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         });
     }
     (new_off, out)
@@ -374,9 +416,16 @@ pub async fn index_once_at(
             let mut n = 0usize;
             {
                 let mut ins = conn.prepare(
+                    // A response already billed by an EARLIER pass (the cursor
+                    // resumed mid-message, or a repeat landed after a flush)
+                    // updates its row to the larger output instead of adding one.
                     "INSERT INTO token_ledger
-                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                       (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd,
+                        message_id, request_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                     ON CONFLICT(conversation, message_id) WHERE message_id IS NOT NULL
+                     DO UPDATE SET output = MAX(output, excluded.output),
+                                   cost_usd = MAX(cost_usd, excluded.cost_usd)",
                 )?;
                 let mut cur = conn.prepare(
                     "INSERT INTO ledger_cursor (conversation, offset, mtime) VALUES (?1,?2,?3)
@@ -386,7 +435,8 @@ pub async fn index_once_at(
                     for t in turns {
                         ins.execute(rusqlite::params![
                             t.ts, t.session, t.conversation, t.model,
-                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost
+                            t.tokens[0], t.tokens[1], t.tokens[2], t.tokens[3], t.cost,
+                            t.message_id, t.request_id
                         ])?;
                         n += 1;
                     }
@@ -405,26 +455,114 @@ pub async fn index_once_at(
     Ok(inserted)
 }
 
-/// py:18219 — fill `token_ledger.task` for turns that fall inside a card's
-/// doing-window for the SAME session. Only touches unattributed rows.
+/// A claim window may not run longer than this, however it ended.
+///
+/// The open-ended window is what made the old attribution wrong, so the
+/// replacement refuses to express one. `task_attempts` closes an abandoned
+/// attempt through the lease reaper and `reconcile_orphans`, but "the writer
+/// will close it" is the same assumption `task_windows` was built on, and it
+/// held until the writer went away. A genuinely long claim loses attribution
+/// for its tail, which is a bounded error; an unclosed one silently absorbs
+/// every later turn on that lane, which is not.
+const MAX_CLAIM_WINDOW_S: i64 = 24 * 3600;
+
+/// Fill `token_ledger.task` for turns that fall inside a card's claim window on
+/// the SAME lane. Only touches unattributed rows.
+///
+/// WHY NOT `task_windows` (AMUX-4581). It has had no writer since the Python
+/// cutover: 484 rows, newest `entered_doing` 2026-08-09, measured 37 days
+/// stale. Four of those windows never closed, and the old query read
+/// `COALESCE(left_doing, now)`, so each one stretched from last July to the
+/// present and swallowed everything after it. Measured over 7 days before this
+/// change: AMUX-1808 took $2,680 of ownerless conversations and AMUX-2598 took
+/// $1,618 of every `amux` turn. The Cost tab's by-task bars were reporting
+/// which stale row won a race, not where the money went.
+///
+/// TWO causes, both fixed here, because swapping the table alone would have
+/// rebuilt the same trap on fresher data:
+///
+/// 1. THE UNBOUNDED WINDOW. `task_attempts` is the live record (written at both
+///    lease choke points), but an attempt that never closes would extend to now
+///    exactly as those four windows did. Capped at `MAX_CLAIM_WINDOW_S`.
+///
+/// 2. THE EMPTY SESSION MATCHING ITSELF. Three of the four absorbing windows
+///    had `session = ''`, and the old `WHERE session=?2` matched them against
+///    ledger rows whose session is also `''` — every ownerless conversation on
+///    the box. An empty lane is not an identity, so a blank on EITHER side now
+///    attributes nothing. This is the clause that actually drained AMUX-1808,
+///    and it is independent of which table the windows come from.
+///
+/// `task.claimed` covers the era before attempts existed: it is the only record
+/// of a claim for ledger rows older than the first attempt row. Its interval
+/// runs to the lane's next claim, capped the same way, so it cannot become an
+/// open window either.
 pub async fn attribute_tasks(store: &SharedStore) -> anyhow::Result<()> {
     store
         .write_async(move |conn| {
             let now = chrono::Utc::now().timestamp();
-            let wins: Vec<(String, String, i64, i64)> = {
-                let mut stmt = conn.prepare(
-                    "SELECT task, session, entered_doing, COALESCE(left_doing, ?1) lo
-                     FROM task_windows ORDER BY entered_doing",
-                )?;
-                let rows = stmt.query_map([now], |r| {
+            let mut wins: Vec<(String, String, i64, i64)> = Vec::new();
+
+            // The live source. `min(a, b)` is SQLite's two-argument scalar min.
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT card, worker, started_at, \
+                        min(COALESCE(ended_at, ?1), started_at + ?2) \
+                 FROM task_attempts \
+                 WHERE COALESCE(worker,'') <> '' AND COALESCE(card,'') <> '' \
+                 ORDER BY started_at",
+            ) {
+                if let Ok(rows) = stmt.query_map([now, MAX_CLAIM_WINDOW_S], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                }) {
+                    wins.extend(rows.flatten());
+                }
+            }
+
+            // The historical source: one interval per claim, ending at that
+            // lane's next claim. `data` carries {"issue": "<id>", ...}.
+            let claims: Vec<(String, String, i64)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT session, data, CAST(ts AS INTEGER) FROM session_events \
+                     WHERE type='task.claimed' AND COALESCE(session,'') <> '' \
+                     ORDER BY session, ts",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?;
                 rows.flatten().collect()
             };
+            for (i, (session, data, ts)) in claims.iter().enumerate() {
+                let Some(card) = serde_json::from_str::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|v| v.get("issue").and_then(|c| c.as_str()).map(str::to_string))
+                    .filter(|c| !c.is_empty())
+                else {
+                    continue;
+                };
+                // The next claim BY THE SAME LANE ends this one. A later claim
+                // by another lane says nothing about when this one stopped.
+                let next = claims[i + 1..]
+                    .iter()
+                    .find(|(s, _, _)| s == session)
+                    .map(|(_, _, t)| *t)
+                    .unwrap_or(now);
+                wins.push((card, session.clone(), *ts, next.min(ts + MAX_CLAIM_WINDOW_S)));
+            }
+
+            // Oldest first, so the earliest claim covering a turn wins it; the
+            // UPDATE only touches rows still unattributed.
+            wins.sort_by_key(|(_, _, from, _)| *from);
             for (task, session, from, to) in wins {
+                if session.trim().is_empty() || task.trim().is_empty() || to < from {
+                    continue;
+                }
                 conn.execute(
-                    "UPDATE token_ledger SET task=?1
-                     WHERE task='' AND session=?2 AND ts>=?3 AND ts<=?4",
+                    "UPDATE token_ledger SET task=?1 \
+                     WHERE task='' AND session=?2 AND COALESCE(session,'') <> '' \
+                       AND ts>=?3 AND ts<=?4",
                     rusqlite::params![task, session, from, to],
                 )?;
             }
@@ -459,6 +597,14 @@ pub fn spawn(state: crate::api::AppState) -> Option<super::PeriodicTask> {
                 // between writer and readers served a confident zero for
                 // 36 hours; a failing indexer must not reproduce that quietly.
                 Err(e) => tracing::warn!(error = %e, "token-ledger index failed"),
+            }
+            // AMUX-4583: codex lanes spend through a different file tree, and
+            // their turns were in no ledger at all. Same tick, same table,
+            // counted separately so "0 codex rows" is readable as a state.
+            match super::codex_ledger::index_once(&store, &home).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(rows = n, provider = "codex", "token-ledger indexed"),
+                Err(e) => tracing::warn!(error = %e, provider = "codex", "token-ledger index failed"),
             }
         }
     }))
@@ -502,6 +648,35 @@ mod tests {
         format!(
             r#"{{"timestamp":"{ts}","message":{{"model":"{model}","usage":{{"input_tokens":{inp},"cache_read_input_tokens":{cr},"cache_creation_input_tokens":{cw},"output_tokens":{out}}}}}}}"#
         )
+    }
+
+    fn line_with_id(model: &str, ts: &str, id: &str, inp: i64, cr: i64, cw: i64, out: i64) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","requestId":"req_{id}","message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{inp},"cache_read_input_tokens":{cr},"cache_creation_input_tokens":{cw},"output_tokens":{out}}}}}}}"#
+        )
+    }
+
+    /// AMUX-4580, the live specimen's shape: one response's usage repeated on
+    /// NON-adjacent lines (a different response in between) is billed once, and
+    /// two different responses with identical counts are both billed.
+    #[test]
+    fn one_response_is_billed_once_by_message_id_even_when_its_repeats_are_not_adjacent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-sub.jsonl");
+        let body = [
+            line_with_id("opus", "2026-09-14T18:00:00Z", "msg_A", 32, 10865, 4512, 3),
+            line_with_id("opus", "2026-09-14T18:00:01Z", "msg_B", 32, 10865, 4512, 3),
+            line_with_id("opus", "2026-09-14T18:00:02Z", "msg_A", 32, 10865, 4512, 3),
+            line_with_id("opus", "2026-09-14T18:00:03Z", "msg_A", 32, 10865, 4512, 3),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&path, &body).unwrap();
+        let (_, turns) = parse_from(&path, 0, 1_786_000_000, "lane", &table());
+        let ids: Vec<_> = turns.iter().map(|t| t.message_id.clone().unwrap()).collect();
+        assert_eq!(ids, vec!["msg_A".to_string(), "msg_B".to_string()],
+            "msg_A billed once despite non-adjacent repeats; msg_B kept though its counts match");
+        assert_eq!(turns[0].request_id.as_deref(), Some("req_msg_A"));
     }
 
     #[test]
@@ -573,6 +748,131 @@ mod tests {
         let st = crate::db::Store::open(&dir.path().join("ledger-test.db")).unwrap();
         std::mem::forget(dir);
         std::sync::Arc::new(st)
+    }
+
+    /// AMUX-4581: the two misattributions the token audit measured, reproduced
+    /// as fixtures and then required NOT to happen.
+    ///
+    /// Both were caused by a window that never closed being read as
+    /// `COALESCE(left_doing, now)`: AMUX-1808 (entered_doing 2026-07-21, no
+    /// session) absorbed $2,680 of ownerless conversations in 7 days, and
+    /// AMUX-2598 (session `amux`) absorbed $1,618 of every amux turn. Both
+    /// stale rows are seeded here in the shape the live DB actually holds.
+    #[tokio::test]
+    async fn a_stale_open_window_stops_absorbing_every_later_turn() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        let july = now - 56 * 86400;
+        st.write(move |conn| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS task_windows (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 task TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', session TEXT NOT NULL DEFAULT '', \
+                 entered_doing INTEGER NOT NULL, left_doing INTEGER);",
+            )?;
+            crate::db::attempts::ensure_table(conn)?;
+            // The two absorbing windows, never closed, exactly as measured.
+            conn.execute(
+                "INSERT INTO task_windows (task, session, entered_doing, left_doing) \
+                 VALUES ('AMUX-1808','',?1,NULL), ('AMUX-2598','amux',?1,NULL)",
+                [july],
+            )?;
+            // THE SAME SHAPE ON THE NEW SOURCE. Without these two rows the
+            // empty-lane rule is untestable: dropping it stays green purely
+            // because the dead table is no longer read, so the fixture would be
+            // proving the table swap and nothing else. An attempt and a claim
+            // that carry no lane are the way AMUX-1808 could come back.
+            conn.execute(
+                "INSERT INTO task_attempts (card, attempt, worker, generation, started_at, ended_at) \
+                 VALUES ('AMUX-1808', 1, '', 1, ?1, NULL)",
+                [now - 3600],
+            )?;
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1,'','task.claimed','{\"issue\":\"AMUX-1808\"}','test')",
+                [now - 3600],
+            )?;
+            // Turns from today: one ownerless, one on the amux lane.
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                 cache_write, output, cost_usd, task) VALUES \
+                 (?1,'','conv-ownerless','m',10,0,0,1,0.5,''), \
+                 (?1,'amux','conv-amux','m',10,0,0,1,0.5,'')",
+                [now - 60],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        attribute_tasks(&st).await.unwrap();
+
+        let task_of = |conv: &str| -> String {
+            st.read()
+                .unwrap()
+                .query_row("SELECT task FROM token_ledger WHERE conversation=?1", [conv], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            task_of("conv-ownerless"),
+            "",
+            "an ownerless conversation must not land on AMUX-1808: an empty lane is not an identity"
+        );
+        assert_eq!(
+            task_of("conv-amux"),
+            "",
+            "a 56-day-old unclosed window must not claim today's amux turn (AMUX-2598)"
+        );
+    }
+
+    /// The other half: with the dead table gone, a REAL claim still attributes.
+    /// Without this the fix above would be indistinguishable from attributing
+    /// nothing at all, which would also make both assertions pass.
+    #[tokio::test]
+    async fn a_live_attempt_and_a_historical_claim_still_attribute() {
+        let st = store();
+        let now = chrono::Utc::now().timestamp();
+        st.write(move |conn| {
+            crate::db::attempts::ensure_table(conn)?;
+            conn.execute(
+                "INSERT INTO task_attempts (card, attempt, worker, generation, started_at, ended_at) \
+                 VALUES ('AMUX-9001', 1, 'lane-a', 1, ?1, NULL)",
+                [now - 600],
+            )?;
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data, source) \
+                 VALUES (?1,'lane-b','task.claimed','{\"issue\":\"AMUX-9002\"}','test')",
+                [now - 500],
+            )?;
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, \
+                 cache_write, output, cost_usd, task) VALUES \
+                 (?1,'lane-a','conv-a','m',10,0,0,1,0.5,''), \
+                 (?1,'lane-b','conv-b','m',10,0,0,1,0.5,''), \
+                 (?2,'lane-a','conv-old','m',10,0,0,1,0.5,'')",
+                [now - 300, now - 40 * 3600],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+
+        attribute_tasks(&st).await.unwrap();
+
+        let task_of = |conv: &str| -> String {
+            st.read()
+                .unwrap()
+                .query_row("SELECT task FROM token_ledger WHERE conversation=?1", [conv], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(task_of("conv-a"), "AMUX-9001", "a running attempt attributes its lane's turn");
+        assert_eq!(task_of("conv-b"), "AMUX-9002", "a task.claimed event still attributes historical turns");
+        assert_eq!(
+            task_of("conv-old"),
+            "",
+            "a turn 40h BEFORE the claim is outside the window and must stay unattributed"
+        );
     }
 
     async fn ledger(store: &SharedStore) -> Vec<(String, String, i64)> {

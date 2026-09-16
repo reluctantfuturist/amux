@@ -514,7 +514,11 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
+    drop(runtime_jobs::host_metrics::spawn(state.clone()));
     drop(runtime_jobs::queue_disposition::spawn(state.clone()));
+    // Record tab transcripts (AMUX-4624): the folder is the work list, so a
+    // restart or a late model install resolves on the next tick.
+    drop(runtime_jobs::recordings_transcribe::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
     // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
     // unset — see runtime_jobs::telegram_poll's module doc for why polling,
@@ -538,6 +542,7 @@ async fn async_main() {
     // total_tokens: 0 for 36 hours (AMUX-2892).
     drop(runtime_jobs::token_ledger::spawn(state.clone()));
     drop(runtime_jobs::board_hygiene::spawn(state.clone()));
+    drop(runtime_jobs::message_capture::spawn(state.clone()));
 
     // THE SCHEDULE FIRING LOOP (AMUX-2647). `run_scheduler` existed, was
     // documented, was gated behind `AMUX_RS_SCHEDULER=1` — and had ZERO call
@@ -567,6 +572,7 @@ async fn async_main() {
     // tell a lane its browser was released (AF-497).
     let reaper_store = state.store.clone();
     api::board_intake::initialize();
+    api::history_ask::initialize();
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed
@@ -596,6 +602,7 @@ async fn async_main() {
     let protocol = Arc::new(opencode::structured::StructuredCliProtocol::with_conversation_sink(
         Arc::new(StoreConversationSink { store: store.clone() }),
     ));
+    opencode::set_process_protocol(protocol.clone());
 
     // Orchestrator runtime: reconcile once, then tick (RR-0041).
     let durable_fleet_state = {

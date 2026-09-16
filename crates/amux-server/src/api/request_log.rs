@@ -228,6 +228,10 @@ impl RequestLogger {
                         }
                         if sweep {
                             let cutoff = unix_now() - retain_days * 86400.0;
+                            conn.execute("DELETE FROM _amux_interaction_effects WHERE interaction_id IN
+                                (SELECT id FROM _amux_interactions WHERE updated_at < ?1)", [(cutoff * 1000.0) as i64])?;
+                            let receipts = conn.execute("DELETE FROM _amux_interactions WHERE updated_at < ?1", [(cutoff * 1000.0) as i64])?;
+                            if receipts > 0 { tracing::info!(verdict="interaction_retention", n_considered=receipts, "Expired interaction receipts removed"); }
                             let deleted = conn.execute(
                                 "DELETE FROM _amux_request_log WHERE ts < ?1",
                                 rusqlite::params![cutoff],
@@ -436,6 +440,12 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     };
 
     let mut meta = serde_json::Map::new();
+    if let Some(id) = res.headers().get("x-amux-interaction-id").and_then(|v| v.to_str().ok()) {
+        meta.insert("interaction_id".into(), json!(id));
+    }
+    if let Some(kind) = res.headers().get("x-amux-command-kind").and_then(|v| v.to_str().ok()) {
+        meta.insert("command_kind".into(), json!(kind));
+    }
     if !query.is_empty() {
         meta.insert("query".into(), json!(truncate_chars(&query, QUERY_CHARS)));
     }
@@ -1210,6 +1220,9 @@ const ANY: &[&str] = &["*"];
 /// public and protected alike. Ordering is by mount site for diffability;
 /// matching specificity is computed, not positional.
 pub const ROUTE_TABLE: &[RouteEntry] = &[
+    RouteEntry { path: "/api/brex/status", methods: &["GET"] },
+    RouteEntry { path: "/api/brex/card", methods: &["POST"] },
+    RouteEntry { path: "/api/brex/webhook", methods: &["POST"] },
     // -- public (outside require_bearer)
     RouteEntry { path: "/health", methods: &["GET"] },
     RouteEntry { path: "/api/health", methods: &["GET"] },
@@ -1233,10 +1246,17 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/gmail/callback", methods: &["GET"] },
     RouteEntry { path: "/invite/{token}", methods: &["GET", "POST"] },
     // -- core state
+    RouteEntry { path: "/api/interactions/recent", methods: &["GET"] },
+    RouteEntry { path: "/api/interactions/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/interactions/{id}/effects", methods: &["GET"] },
+    RouteEntry { path: "/api/interactions/{id}/why", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/interactions", methods: &["GET"] },
+    RouteEntry { path: "/api/state/summary", methods: &["GET"] },
     RouteEntry { path: "/api/sync", methods: &["GET"] },
     RouteEntry { path: "/api/events", methods: &["GET"] },
     // -- board
     RouteEntry { path: "/api/board", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board-lifecycle", methods: &["GET"] },
     RouteEntry { path: "/api/board/export", methods: &["GET"] },
     RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
@@ -1246,6 +1266,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
+    RouteEntry { path: "/api/board/lease-next", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap", methods: &["POST"] },
     RouteEntry { path: "/api/board/overlap/deployment-permit", methods: &["GET"] },
     RouteEntry { path: "/api/board/overlap/{coordination_id}", methods: &["GET"] },
@@ -1265,6 +1286,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/workers/{id}", methods: &["GET", "PATCH", "DELETE"] },
     RouteEntry { path: "/api/workers/{id}/start", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/stop", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/pause", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/resume", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/peek", methods: &["GET"] },
     RouteEntry { path: "/api/workers/{id}/send", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/duplicate", methods: &["POST"] },
@@ -1340,6 +1363,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- metrics / usage / alerts / stats
     RouteEntry { path: "/api/metrics", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/host", methods: &["GET"] },
+    RouteEntry { path: "/api/metrics/host/history", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/fleet", methods: &["GET"] },
     RouteEntry { path: "/api/metrics/replay", methods: &["GET"] },
     RouteEntry { path: "/api/reclaim/scan", methods: &["GET", "POST"] },
@@ -1353,6 +1377,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },
     RouteEntry { path: "/api/usage", methods: &["GET"] },
     RouteEntry { path: "/api/usage/attribution", methods: &["GET"] },
+    RouteEntry { path: "/api/usage/report.md", methods: &["GET"] },
     RouteEntry { path: "/api/alert/config", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/alert/owner", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/stats/daily", methods: &["GET"] },
@@ -1402,6 +1427,19 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/scope", methods: ANY },
     // -- browser
     RouteEntry { path: "/api/browser/start", methods: &["POST"] },
+    // The simulator is nested inside browser::routes(), one composition level
+    // below api/mod.rs. Keep its real verbs visible to request-log verdicts
+    // and route.callers_have_routes, just like the desktop browser verbs.
+    RouteEntry { path: "/api/browser/ios/targets", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/start", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/status", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/stop", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/state", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/screenshot", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/screenshot/file", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/action", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/ios/inspect", methods: &["GET"] },
+    RouteEntry { path: "/api/browser/ios/inspect/clear", methods: &["POST"] },
     RouteEntry { path: "/api/browser/status", methods: &["GET"] },
     RouteEntry { path: "/api/browser/stop", methods: &["POST"] },
     RouteEntry { path: "/api/browser/identify", methods: &["POST"] },
@@ -1413,6 +1451,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/browser/screenshot/file", methods: &["GET"] },
     RouteEntry { path: "/api/browser/state", methods: &["GET"] },
     RouteEntry { path: "/api/browser/action", methods: &["POST"] },
+    RouteEntry { path: "/api/browser/keepalive", methods: &["POST"] },
     RouteEntry { path: "/api/browser/inspect", methods: &["GET"] },
     RouteEntry { path: "/api/browser/inspect/clear", methods: &["POST"] },
     RouteEntry { path: "/api/browser/search", methods: &["GET"] },
@@ -1491,6 +1530,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
     RouteEntry { path: "/api/board/derived", methods: &["GET"] },
     RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/drain", methods: &["GET"] },
     RouteEntry { path: "/api/board/changes", methods: &["GET"] },
     RouteEntry { path: "/api/board/bulk-migrate", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/decompose", methods: &["POST"] },
@@ -1567,6 +1607,12 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // against the live server (AMUX-2871). Each was reported as unrouted while
     // answering, because the census reads this table.
     RouteEntry { path: "/api/client-debug", methods: &["GET", "POST"] },
+    // Both of screen::routes()'s paths. The census reads this TABLE, so a
+    // mounted-but-unlisted route answers fine while every count reports it as
+    // unrouted (AMUX-4661's route, listed here after proxy_composition and this
+    // census both went red on origin/main).
+    RouteEntry { path: "/api/screen/capture", methods: &["GET"] },
+    RouteEntry { path: "/api/screen/capture/file", methods: &["GET"] },
     RouteEntry { path: "/api/memory/global", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/review/week", methods: &["GET"] },
     RouteEntry { path: "/api/review/digest", methods: &["GET"] },
@@ -1603,12 +1649,15 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/env/schema", methods: &["GET"] },
     RouteEntry { path: "/api/history", methods: &["GET", "POST", "DELETE"] },
     RouteEntry { path: "/api/history/import", methods: &["POST"] },
+    // AMUX-4664: ask a question of the messages.
+    RouteEntry { path: "/api/history/ask", methods: &["POST"] },
     // Nested sub-router routes that were missing from the table (AMUX-3083): they
     // answer for real (POST /api/orchestrate/plan -> 400 transcript-required, GET
     // /api/history/{id} -> the row) while /api/debug/routes and the
     // route.callers_have_routes census read the TABLE and reported them unrouted.
     // Caught by tests/route_table.rs's completeness scan (both were named).
     RouteEntry { path: "/api/history/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/history/{id}/card", methods: &["PUT"] },
     RouteEntry { path: "/api/orchestrate/plan", methods: &["POST"] },
     // -- logs (this module)
     RouteEntry { path: "/api/logs", methods: &["GET"] },
@@ -1645,6 +1694,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/dictation/dict/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/dictation/config", methods: ANY },
     RouteEntry { path: "/api/dictate", methods: &["POST"] },
+    RouteEntry { path: "/api/recordings", methods: &["GET"] },
+    RouteEntry { path: "/api/recordings/config", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/recordings/upload", methods: &["POST"] },
+    RouteEntry { path: "/api/recordings/{id}", methods: &["GET"] },
+    RouteEntry { path: "/api/recordings/{id}/transcribe", methods: &["POST"] },
     RouteEntry { path: "/api/tts", methods: &["POST"] },
     RouteEntry { path: "/api/tts/voices", methods: &["GET"] },
     // -- torrents / org / gmail
@@ -2012,6 +2066,7 @@ async fn analyze(
                 client_ip.as_deref().unwrap_or(""),
             );
             let has_body = error_body.as_deref().is_some_and(|b| !b.is_empty());
+            let interaction = req_meta.as_deref().and_then(|m| serde_json::from_str::<Value>(m).ok()).unwrap_or(Value::Null);
             let sample = json!({
                 "ts": ts, "when": local_when(ts), "method": method, "path": path,
                 "status": status, "latency_ms": latency_ms,
@@ -2019,6 +2074,8 @@ async fn analyze(
                 "amux_session": amux_session, "worker": worker,
                 "answered_by": answered_by, "error_body": error_body,
                 "req_meta": req_meta,
+                "interaction_id": interaction["interaction_id"],
+                "command_kind": interaction["command_kind"],
             });
             let key = (status, method.clone(), family.clone(), target.clone());
             let g = groups.entry(key).or_insert_with(|| ErrGroup {
@@ -2807,7 +2864,7 @@ fn round4(v: f64) -> f64 {
 /// Every family claimed by a NAMED tab. `http` is the complement of this set,
 /// so the two definitions cannot disagree about what "everything else" means.
 const NAMED_CATEGORY_FAMILIES: &[&str] = &[
-    "/api/board", "/api/schedules", "/api/cal-events", "/api/calendar",
+    "/api/board", "/api/board-lifecycle", "/api/schedules", "/api/cal-events", "/api/calendar",
     "/api/sessions", "/api/workers", "/api/sessions-git", "/api/channels",
     "/api/memory", "/api/memories", "/api/scope", "/api/notes",
     "/api/fs", "/api/file", "/api/files", "/api/upload", "/api/uploads", "/api/library",
@@ -2839,7 +2896,7 @@ fn families_for_category(cat: &str) -> Vec<&'static str> {
 /// category, and the All tab shows it regardless.
 fn category_of(family: &str) -> &'static str {
     match family {
-        "/api/board" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
+        "/api/board" | "/api/board-lifecycle" | "/api/schedules" | "/api/cal-events" | "/api/calendar" => "board",
         "/api/sessions" | "/api/workers" | "/api/sessions-git" | "/api/channels" => "session",
         "/api/memory" | "/api/memories" | "/api/scope" | "/api/notes" => "memory",
         "/api/fs" | "/api/file" | "/api/files" | "/api/upload" | "/api/uploads"

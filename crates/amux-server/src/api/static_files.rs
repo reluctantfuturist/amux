@@ -104,7 +104,7 @@ async fn index(
     peer: Peer,
     legacy: Legacy,
 ) -> Response {
-    serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer))
+    serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await
 }
 
 async fn serve_path(
@@ -138,7 +138,7 @@ async fn serve_path(
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     if matches!(path, "business" | "business/" | "business/index.html") {
-        return serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer));
+        return serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await;
     }
     match DashboardAssets::get(path) {
         Some(content) => {
@@ -155,7 +155,7 @@ async fn serve_path(
         }
         // SPA fallback: unknown NON-API paths get the shell so client routing
         // works offline-first.
-        None => serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)),
+        None => serve_shell(&state, legacy_port_of(legacy), &headers, &uri, peer_ip(peer)).await,
     }
 }
 
@@ -216,7 +216,7 @@ fn establish_owner_session(state: &AppState) -> Response {
     tracing::info!(
         target: "amux::local_invite",
         verdict = "owner_session_established",
-        "an explicit owner URL credential was exchanged for an HttpOnly session"
+        "verified owner access was exchanged for an HttpOnly session"
     );
     response
 }
@@ -249,7 +249,9 @@ pub async fn clear_sw_landing() -> Response {
     ).into_response()
 }
 
-fn serve_shell(
+mod tailnet_auth;
+
+async fn serve_shell(
     state: &AppState,
     legacy: Option<u16>,
     headers: &HeaderMap,
@@ -261,6 +263,16 @@ fn serve_shell(
     // `/` fetch and reload without leaving the bearer in history or caches.
     if super::auth::has_owner_query_token(state, uri) {
         return establish_owner_session(state);
+    }
+    // Same-owner Tailscale devices may opt into the existing HttpOnly owner
+    // session. Use the real socket peer and daemon identity, never a forwarded
+    // IP, hostname, or a claim supplied by the browser. Invitees remain scoped.
+    if state.auth_token.is_some() && !has_owner_session(state, headers)
+        && !super::org::has_local_member_cookie(headers)
+    {
+        if let Some(ip) = peer {
+            if tailnet_auth::verified(ip).await { return establish_owner_session(state); }
+        }
     }
     serve_index(state, legacy, headers, uri, peer)
 }
@@ -468,7 +480,7 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
          window._AMUX_POSTHOG_KEY={};window._AMUX_POSTHOG_HOST={};window._AMUX_USER_EMAIL={};\
          window._AMUX_USER_ID={};window._AMUX_UI_TOKEN={};window._AMUX_DEFAULT_MODEL={};\
          window._AMUX_LEGACY_PORT={};window._AMUX_CANONICAL_PORT={};\
-         window._AMUX_AUTH_WITHHELD={};</script>\n",
+         window._AMUX_AUTH_WITHHELD={};window._AMUX_MDAI_ROOT={};</script>\n",
         jstr(&ical_subscribe_url()),
         jstr(&auth),
         jstr(&home),
@@ -490,6 +502,10 @@ fn inject_bootstrap(html: &str, state: &AppState, legacy: Option<u16>, owner_acc
         legacy.unwrap_or(0),
         crate::legacy_port::canonical_port(),
         auth_withheld,
+        // The `.mdai` scan root, so the client joins list paths onto the right
+        // root instead of $HOME when a `mdai_root` pref points elsewhere
+        // (AMUX-4477).
+        jstr(&crate::api::mdai::mdai_root_str()),
     );
     let with_bootstrap = format!("{}{}{}", &html[..b], block, &html[e..]);
     // Client update adoption is the SSE ping's job, exactly like Python
@@ -567,7 +583,7 @@ mod tests {
 
     #[test]
     fn bootstrap_injects_auth_and_derived_ui_token() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
         assert!(out.contains("window._AMUX_AUTH_TOKEN=\"tok123\""));
         // Python-parity UI token: sha256("amux-ui-guard:tok123")[..40]
@@ -575,12 +591,15 @@ mod tests {
         h.update("amux-ui-guard:tok123");
         let expect = &hex::encode(h.finalize())[..40];
         assert!(out.contains(expect), "{out}");
-        assert!(!out.contains("old"), "placeholder block replaced");
+        // AMUX-4658: the placeholder used to be the word `old`, and `out` embeds
+        // $HOME. A parallel test points HOME at a macOS tempdir under
+        // /var/folders, which contains "old", so this failed on local runs.
+        assert!(!out.contains("STALE-BOOTSTRAP-PLACEHOLDER"), "placeholder block replaced: {out}");
     }
 
     #[test]
     fn invited_member_bootstrap_withholds_owner_bearer_but_keeps_ui_guard() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let member = inject_bootstrap(html, &state(Some("tok123")), None, false);
         assert!(member.contains("window._AMUX_AUTH_TOKEN=\"\""), "{member}");
@@ -648,7 +667,7 @@ mod tests {
 
         // And the shell built from that decision really is tokenless, so the
         // record describes a window that will 401 rather than a hypothesis.
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let shell = inject_bootstrap(html, &state(Some("tok123")), None, allowed);
         assert!(shell.contains("window._AMUX_AUTH_TOKEN=\"\""), "{shell}");
         assert!(shell.contains("window._AMUX_AUTH_WITHHELD=true;"), "{shell}");
@@ -659,7 +678,7 @@ mod tests {
     /// empty string.
     #[test]
     fn the_shell_says_whether_an_empty_token_means_withheld_or_auth_disabled() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let owner = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let withheld = inject_bootstrap(html, &state(Some("tok123")), None, false);
         let no_auth = inject_bootstrap(html, &state(None), None, false);
@@ -681,7 +700,7 @@ mod tests {
     /// covers the whole script rather than the line just added to it.
     #[test]
     fn the_injected_script_carries_no_run_of_spaces_from_a_dropped_continuation() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head>";
         let out = inject_bootstrap(html, &state(Some("tok123")), None, true);
         let script = out
             .split("<script>")
@@ -702,7 +721,7 @@ mod tests {
         // Client adoption rides the SSE ping's `v` (sse.rs::ping_payload,
         // Python parity) — the old /health-polling banner must stay gone,
         // or a backend-only deploy shows UI Python never showed.
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
         let out = inject_bootstrap(html, &s, None, true);
         assert!(!out.contains("AMUX-UPDATE-WATCH"));
@@ -724,7 +743,7 @@ mod tests {
     /// SOCKET the request arrived on.
     #[test]
     fn legacy_marker_is_injected_only_when_served_on_the_retired_port() {
-        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->old<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
+        let html = "<head><!-- AMUX-BOOTSTRAP-BEGIN x -->STALE-BOOTSTRAP-PLACEHOLDER<!-- AMUX-BOOTSTRAP-END --></head><body></body>";
         let s = state(Some("tok"));
 
         let canonical = inject_bootstrap(html, &s, None, true);

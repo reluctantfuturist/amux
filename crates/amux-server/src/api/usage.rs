@@ -308,6 +308,8 @@ fn routes_with_probes(probes: UsageProbes) -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(get_usage))
         .route("/attribution", axum::routing::get(get_attribution))
+        // AMUX-4584: the same numbers as markdown, deterministic, for MDAI.
+        .route("/report.md", axum::routing::get(get_usage_report_md))
         .layer(Extension(probes))
         .layer(Extension(Arc::new(tokio::sync::Mutex::new(
             UsageCache::default(),
@@ -881,12 +883,11 @@ async fn get_attribution(
         )?;
 
         let mut stmt = conn.prepare(
-            "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1) \
-             SELECT COALESCE((SELECT h.type FROM cmd_history h \
-                                WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                                ORDER BY h.ts DESC LIMIT 1), '') AS trig, \
-                    SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
-             FROM lg GROUP BY 1 ORDER BY 2 DESC",
+            &format!(
+                "WITH lg AS (SELECT ts, session, cost_usd, input, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+                 SELECT {PROMPT_SOURCE_TRIG} AS trig, SUM(cost_usd), COUNT(*), SUM(input), SUM(output) \
+                 FROM src GROUP BY 1 ORDER BY 2 DESC"
+            ),
         )?;
         let rows = stmt.query_map([cutoff], |r| {
             Ok((
@@ -956,6 +957,229 @@ async fn get_attribution(
     }
 }
 
+// AMUX-4584: GET /api/usage/report.md — the token-usage dashboard as markdown.
+//
+// Deterministic by construction: SQL over token_ledger plus the same prompt
+// attribution join /api/usage/attribution uses, rendered with format!. No model
+// call, so an MDAI file that `fetch:`es this URL renders the same bytes for the
+// same ledger (ethos rule 2: compute what you can compute).
+//
+// Every table states the population it was computed over and is sorted by cost,
+// so "where is most of my token usage going" is answered by reading top-down.
+// Known limits are printed in the report itself, not left to a comment, because
+// the reader of a dashboard never reads the source.
+
+#[derive(serde::Deserialize, Default)]
+struct ReportQuery {
+    days: Option<i64>,
+    limit: Option<usize>,
+}
+
+fn md_money(v: f64) -> String {
+    format!("${:.2}", v)
+}
+
+fn md_tokens(v: i64) -> String {
+    let s = v.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+fn pct(part: f64, total: f64) -> String {
+    if total > 0.0 {
+        format!("{:.1}%", part / total * 100.0)
+    } else {
+        "0.0%".to_string()
+    }
+}
+
+/// One grouped breakdown: `(label, cost, tokens, turns)` rows, already sorted.
+fn md_table(title: &str, key_header: &str, rows: &[(String, f64, i64, i64)], total_cost: f64) -> String {
+    let mut s = format!("\n## {title}\n\n| {key_header} | Cost | Share | Tokens | Turns |\n|---|---:|---:|---:|---:|\n");
+    if rows.is_empty() {
+        s.push_str("| (none in window) | | | | |\n");
+    }
+    for (k, cost, tokens, turns) in rows {
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            md_cell(if k.is_empty() { "(unattributed)" } else { k }),
+            md_money(*cost),
+            pct(*cost, total_cost),
+            md_tokens(*tokens),
+            turns
+        ));
+    }
+    s
+}
+
+const REPORT_TOKENS: &str = "(input + cache_read + cache_write + output)";
+
+fn grouped(
+    conn: &rusqlite::Connection,
+    select_key: &str,
+    cutoff: i64,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, f64, i64, i64)>> {
+    let sql = format!(
+        "SELECT {select_key} AS k, COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) \
+         FROM token_ledger WHERE ts > ?1 GROUP BY k ORDER BY 2 DESC LIMIT ?2"
+    );
+    let mut st = conn.prepare(&sql)?;
+    let rows = st.query_map(rusqlite::params![cutoff, limit as i64], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            r.get::<_, f64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Render the report. Pure over a connection so a test can pin its shape.
+pub(crate) fn render_usage_report(conn: &rusqlite::Connection, days: i64, limit: usize, now: i64) -> rusqlite::Result<String> {
+    let cutoff = now - days * 86_400;
+    let total_rows: i64 = conn.query_row("SELECT COUNT(*) FROM token_ledger", [], |r| r.get(0))?;
+    let (total_cost, total_tokens, turns): (f64, i64, i64) = conn.query_row(
+        &format!("SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM{REPORT_TOKENS},0), COUNT(*) FROM token_ledger WHERE ts > ?1"),
+        [cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let fresh: Option<i64> = conn.query_row("SELECT MAX(ts) FROM token_ledger", [], |r| r.get(0))?;
+    let (cache_read, input_side): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(cache_read),0), COALESCE(SUM(input + cache_read + cache_write),0) FROM token_ledger WHERE ts > ?1",
+        [cutoff],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+
+    let mut md = String::new();
+    md.push_str(&format!("# Token usage, last {days} day(s)\n\n"));
+    md.push_str(&format!(
+        "- **Total:** {} across {} API responses, {} tokens {REPORT_TOKENS}\n",
+        md_money(total_cost),
+        turns,
+        md_tokens(total_tokens)
+    ));
+    md.push_str(&format!("- **Cache hit:** {} of input-side tokens were cache reads\n", pct(cache_read as f64, input_side as f64)));
+    md.push_str(&format!(
+        "- **Measured:** {} ledger rows in window of {} total; ledger fresh through {}\n",
+        turns,
+        total_rows,
+        fresh.map(|t| chrono::DateTime::from_timestamp(t, 0).map(|d| d.to_rfc3339()).unwrap_or_default()).unwrap_or_else(|| "never".into())
+    ));
+    md.push_str("- **Cost basis:** list price per model from runtime_jobs/token_ledger.rs (or ~/.amux/prices.json), not the plan invoice\n");
+
+    md.push_str(&md_table("By worker", "Worker", &grouped(conn, "session", cutoff, limit)?, total_cost));
+    md.push_str(&md_table("By model", "Model", &grouped(conn, "model", cutoff, limit)?, total_cost));
+    md.push_str(&md_table(
+        "Main conversation vs subagents",
+        "Kind",
+        &grouped(conn, "CASE WHEN conversation LIKE 'agent-%' THEN 'subagent' ELSE 'main' END", cutoff, limit)?,
+        total_cost,
+    ));
+
+    // Prompt source: the same definition /api/usage/attribution uses, now
+    // including steering deliveries (AMUX-4582).
+    let mut st = conn.prepare(
+        &format!(
+            "WITH lg AS (SELECT ts, session, cost_usd, input, cache_read, cache_write, output FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG} AS trig, \
+                    SUM(cost_usd), SUM(input + cache_read + cache_write + output), COUNT(*) \
+             FROM src GROUP BY 1 ORDER BY 2 DESC"
+        ),
+    )?;
+    let sources: Vec<(String, f64, i64, i64)> = st
+        .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    md.push_str(&md_table("By what triggered the turn", "Source (prompt or steering guard)", &sources, total_cost));
+
+    // By card: attributed rows only; the stale task_windows problem is named.
+    md.push_str(&md_table(
+        "By board card",
+        "Card",
+        &grouped(conn, "NULLIF(task, '')", cutoff, limit)?,
+        total_cost,
+    ));
+
+    md.push_str(&md_table(
+        "By day (UTC)",
+        "Day",
+        &{
+            let mut st = conn.prepare(&format!(
+                "SELECT date(ts, 'unixepoch') AS d, SUM(cost_usd), SUM{REPORT_TOKENS}, COUNT(*) FROM token_ledger \
+                 WHERE ts > ?1 GROUP BY d ORDER BY d DESC"
+            ))?;
+            let rows: Vec<(String, f64, i64, i64)> = st
+                .query_map([cutoff], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        },
+        total_cost,
+    ));
+
+    md.push_str(&md_table(
+        "Top conversations",
+        "Worker / conversation",
+        &grouped(conn, "session || ' / ' || conversation", cutoff, limit)?,
+        total_cost,
+    ));
+
+    md.push_str(
+        "\n## Known limits of these numbers\n\n\
+         - Subagent rows indexed before migration 70 can be billed more than once per API response (AMUX-4580); newer rows are keyed by message id.\n\
+         - Card attribution reads `token_ledger.task`, filled from `task_windows`, which has had no writer since 2026-08-09 (AMUX-4581).\n\
+         - Nudges, schedule fires and auto-compacts delivered through the steering queue are credited to the prompt before them (AMUX-4582).\n\
+         - Codex and Gemini usage is not captured yet (AMUX-4583).\n",
+    );
+    Ok(md)
+}
+
+
+/// GET /api/usage/report.md?days=N&limit=M (AMUX-4584). `days` 1..365 (default 7),
+/// `limit` rows per breakdown 1..200 (default 25). text/markdown.
+async fn get_usage_report_md(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ReportQuery>,
+) -> Response {
+    let days = q.days.unwrap_or(7).clamp(1, 365);
+    let limit = q.limit.unwrap_or(25).clamp(1, 200);
+    let store = state.store.clone();
+    let out = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let conn = store.read()?;
+        Ok(render_usage_report(&conn, days, limit, chrono::Utc::now().timestamp())?)
+    })
+    .await;
+    match out {
+        Ok(Ok(md)) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+            md,
+        )
+            .into_response(),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string(), "measured": false })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string(), "measured": false })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(serde::Deserialize, Default)]
 struct AttributionQuery {
     hours: Option<i64>,
@@ -963,6 +1187,49 @@ struct AttributionQuery {
 
 /// Plain English, because the audience is a person wondering where their
 /// credits went, not someone who knows what `cmd_history.type` is.
+/// Which prompt a turn is credited to: the LATEST one the lane received at or
+/// before it, from EITHER history table.
+///
+/// AMUX-4582. This used to read `cmd_history` alone. Steering deliveries write
+/// only `steering_history` (board-drive nudges, board-progress, `sched:` fires,
+/// the commit nudge, auto-compact, the browser reaper, the staged guard), so
+/// every turn they started was credited to the prompt BEFORE them, which is
+/// frequently the human's. That is the exact inversion this view exists to
+/// prevent: it answers "did amux hand me this, or did I ask for it?".
+///
+/// Written once and interpolated into all three readers (by_source, top
+/// origins, the markdown report) rather than restated in each: a view must
+/// share the predicate of the mechanism it describes, and three copies of a
+/// join is how two of them end up disagreeing.
+const PROMPT_SOURCE_SRC: &str = "\
+ src AS (SELECT lg.*, \
+   (SELECT h.ts/1000 FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_ts, \
+   (SELECT COALESCE(h.type,'') FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_type, \
+   (SELECT COALESCE(h.origin,'') FROM cmd_history h \
+      WHERE h.session = lg.session AND h.ts/1000 <= lg.ts ORDER BY h.ts DESC LIMIT 1) AS c_origin, \
+   (SELECT s.delivered_at FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_ts, \
+   (SELECT COALESCE(NULLIF(s.guard,''),'steering') FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_guard, \
+   (SELECT COALESCE(s.sender,'') FROM steering_history s \
+      WHERE s.session = lg.session AND s.delivered_at <= lg.ts ORDER BY s.delivered_at DESC LIMIT 1) AS s_sender \
+   FROM lg)";
+
+/// The source key. A steering guard becomes `steer:<family>`, the part before
+/// its first colon, so `sched:SCHED-456` and `task-callback:TUBES-2790` group
+/// as `steer:sched` and `steer:task-callback` instead of one bucket per id.
+const PROMPT_SOURCE_TRIG: &str = "CASE WHEN src.s_ts IS NOT NULL AND (src.c_ts IS NULL OR src.s_ts > src.c_ts) \
+   THEN 'steer:' || CASE WHEN instr(src.s_guard, ':') > 0 \
+                         THEN substr(src.s_guard, 1, instr(src.s_guard, ':') - 1) ELSE src.s_guard END \
+   ELSE COALESCE(src.c_type, '') END";
+
+/// Who or what sent it, for the named-offenders list: the steering sender when
+/// steering won, the cmd_history origin otherwise.
+const PROMPT_SOURCE_ORIGIN: &str = "CASE WHEN src.s_ts IS NOT NULL AND (src.c_ts IS NULL OR src.s_ts > src.c_ts) \
+   THEN src.s_sender ELSE COALESCE(src.c_origin, '') END";
+
 fn trigger_label(t: &str) -> &'static str {
     match t {
         "user" => "you typed it",
@@ -973,9 +1240,25 @@ fn trigger_label(t: &str) -> &'static str {
         // board_drive::record_prompt shipped, pickup turns had no row and were
         // credited to whatever prompt preceded them — including the human's.
         "pickup" => "amux handed this lane a board card",
+        // Live on this box: 573 turns and $320 in a day reading as "other"
+        // because only the steering spelling had a label (AMUX-4582).
+        "task-callback" => "a task callback from a peer",
         "system" => "an amux nudge",
         "direct" | "steering" => "a steering message",
         "" => "no prompt matched; the turn predates this lane's history",
+        // AMUX-4582: steering deliveries, named by what sent them. Each of
+        // these was previously credited to the prompt before it.
+        "steer:board-drive" => "amux nudged this lane about a card",
+        "steer:board-progress" => "a board progress note",
+        "steer:sched" => "a schedule fired",
+        "steer:commit-nudge" => "the commit nudge",
+        "steer:auto-compact" | "steer:compact" => "an auto-compact",
+        "steer:task-callback" => "a task callback from a peer",
+        "steer:browser-reaper" => "the browser reaper",
+        "steer:staged-guard" => "the staged guard",
+        "steer:deferred-automation" => "deferred automation",
+        "steer:steering" => "a steering message with no guard",
+        other if other.starts_with("steer:") => "an amux nudge",
         _ => "other",
     }
 }
@@ -983,15 +1266,11 @@ fn trigger_label(t: &str) -> &'static str {
 /// The named offenders inside the background bucket.
 fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1) \
-         SELECT COALESCE((SELECT h.type FROM cmd_history h \
-                            WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                            ORDER BY h.ts DESC LIMIT 1), ''), \
-                COALESCE((SELECT h.origin FROM cmd_history h \
-                            WHERE h.session = lg.session AND h.ts/1000 <= lg.ts \
-                            ORDER BY h.ts DESC LIMIT 1), ''), \
-                lg.session, SUM(cost_usd), COUNT(*) \
-         FROM lg GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10",
+        &format!(
+            "WITH lg AS (SELECT ts, session, cost_usd FROM token_ledger WHERE ts > ?1), {PROMPT_SOURCE_SRC} \
+             SELECT {PROMPT_SOURCE_TRIG}, {PROMPT_SOURCE_ORIGIN}, src.session, SUM(cost_usd), COUNT(*) \
+             FROM src GROUP BY 1,2,3 ORDER BY 4 DESC LIMIT 10"
+        ),
     )?;
     let rows = stmt.query_map([cutoff], |r| {
         Ok((
@@ -1776,5 +2055,159 @@ mod tests {
     #[test]
     fn ttl_default_and_override() {
         assert_eq!(usage_ttl(), Duration::from_secs(DEFAULT_USAGE_TTL_S));
+    }
+}
+
+#[cfg(test)]
+mod usage_report_tests {
+    use super::render_usage_report;
+
+    use super::trigger_label;
+
+    fn ledger_row(conn: &rusqlite::Connection, session: &str, ts: i64, cost: f64) {
+        conn.execute(
+            "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+             VALUES (?1, ?2, 'conv', 'claude-opus-5', 10, 0, 0, 5, ?3, '')",
+            rusqlite::params![ts, session, cost],
+        )
+        .unwrap();
+    }
+
+    fn typed_prompt(conn: &rusqlite::Connection, session: &str, ts_secs: i64, kind: &str) {
+        conn.execute(
+            "INSERT INTO cmd_history (text, type, session, ts, origin) VALUES ('do the thing', ?1, ?2, ?3, 'ethan')",
+            rusqlite::params![kind, session, ts_secs * 1000],
+        )
+        .unwrap();
+    }
+
+    fn steering_delivery(conn: &rusqlite::Connection, id: &str, session: &str, ts_secs: i64, guard: &str, sender: &str) {
+        conn.execute(
+            "INSERT INTO steering_history (id, session, text, queued_at, delivered_at, guard, sender) \
+             VALUES (?1, ?2, 'nudge text', ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, session, ts_secs as f64, ts_secs as f64, guard, sender],
+        )
+        .unwrap();
+    }
+
+    fn source_keys(md: &str) -> Vec<String> {
+        // Stop at the next heading: the report has more tables below this one,
+        // and reading past it collected their rows as sources.
+        let section = md.split("## By what triggered the turn").nth(1).unwrap();
+        let section = section.split("\n## ").next().unwrap_or(section);
+        section
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.contains("---"))
+            .skip(1)   // the table's own header row is not a source
+            .map(|l| l.trim_start_matches("| ").split(" |").next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// AMUX-4582: a turn a NUDGE started is credited to the nudge.
+    ///
+    /// Before this, the nudge wrote only `steering_history`, the join saw only
+    /// `cmd_history`, and the turn was charged to the human prompt that
+    /// happened to precede it. That inverts the one question this view exists
+    /// to answer, and it inflates what looks like human-requested spend.
+    #[test]
+    fn a_steering_delivered_turn_is_credited_to_the_steering_guard() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+
+        // The human typed something an hour before; then amux nudged; then the
+        // lane spent tokens. The spend belongs to the nudge.
+        typed_prompt(&conn, "amux", now - 3600, "user");
+        steering_delivery(&conn, "s1", "amux", now - 120, "board-drive", "");
+        ledger_row(&conn, "amux", now - 60, 4.0);
+
+        // A lane whose newest prompt really is the human's keeps it: the CONTROL
+        // that separates "reads steering" from "always says steering".
+        typed_prompt(&conn, "solo", now - 300, "user");
+        ledger_row(&conn, "solo", now - 60, 1.0);
+
+        // A schedule fire groups by family, not one bucket per schedule id.
+        steering_delivery(&conn, "s2", "cron", now - 200, "sched:SCHED-456", "");
+        ledger_row(&conn, "cron", now - 60, 2.0);
+
+        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        let keys = source_keys(&md);
+        assert!(keys.contains(&"steer:board-drive".to_string()), "the nudge is its own source: {keys:?}");
+        assert!(keys.contains(&"steer:sched".to_string()), "sched:SCHED-456 groups as its family: {keys:?}");
+        assert!(keys.contains(&"user".to_string()), "a genuinely human-prompted turn still reads user: {keys:?}");
+        assert!(!keys.iter().any(|k| k.contains("SCHED-456")), "not one bucket per schedule id: {keys:?}");
+
+        // And the money moved with it: $4 of nudge-driven spend that used to be
+        // filed under the human prompt.
+        let section = md.split("## By what triggered the turn").nth(1).unwrap();
+        let section = section.split("\n## ").next().unwrap_or(section);
+        let nudge_line = section.lines().find(|l| l.starts_with("| steer:board-drive")).unwrap();
+        assert!(nudge_line.contains("$4.00"), "{nudge_line}");
+        let human_line = section.lines().find(|l| l.starts_with("| user")).unwrap();
+        assert!(human_line.contains("$1.00"), "only the lane that really typed it: {human_line}");
+    }
+
+    /// A steering row OLDER than the lane's newest prompt must not win: the rule
+    /// is "the latest prompt", not "steering beats everything".
+    #[test]
+    fn the_newest_prompt_wins_whichever_table_it_came_from() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+        steering_delivery(&conn, "s1", "amux", now - 600, "board-drive", "");
+        typed_prompt(&conn, "amux", now - 120, "user");
+        ledger_row(&conn, "amux", now - 60, 3.0);
+        let keys = source_keys(&render_usage_report(&conn, 1, 25, now).unwrap());
+        assert_eq!(keys, vec!["user".to_string()], "the human typed after the nudge: {keys:?}");
+    }
+
+    #[test]
+    fn every_steering_family_reads_as_itself_and_an_unknown_one_still_reads_as_a_nudge() {
+        assert_eq!(trigger_label("steer:board-drive"), "amux nudged this lane about a card");
+        assert_eq!(trigger_label("steer:sched"), "a schedule fired");
+        assert_eq!(trigger_label("steer:commit-nudge"), "the commit nudge");
+        assert_eq!(trigger_label("steer:auto-compact"), "an auto-compact");
+        assert_eq!(trigger_label("steer:task-callback"), "a task callback from a peer");
+        // A guard nobody has taught this table still reads as amux, not "other":
+        // the question is "did amux hand me this", and the answer is yes.
+        assert_eq!(trigger_label("steer:some-future-job"), "an amux nudge");
+        assert_eq!(trigger_label("user"), "you typed it");
+        // Both spellings of the same thing read the same: cmd_history writes
+        // `task-callback`, steering writes the guard.
+        assert_eq!(trigger_label("task-callback"), trigger_label("steer:task-callback"));
+    }
+
+    #[test]
+    fn the_markdown_report_is_sorted_by_cost_and_states_its_population() {
+        let conn = crate::db::migrate::test_memdb();
+        let now = 1_789_400_000i64;
+        for (session, conv, model, cost, out) in [
+            ("amux", "c1", "claude-opus-5", 5.0, 100),
+            ("amux", "agent-x", "claude-opus-5", 1.0, 10),
+            ("studio-plg", "c2", "claude-sonnet-5", 9.0, 50),
+        ] {
+            conn.execute(
+                "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+                 VALUES (?1, ?2, ?3, ?4, 10, 20, 30, ?5, ?6, '')",
+                rusqlite::params![now - 60, session, conv, model, out, cost],
+            ).unwrap();
+        }
+        // Outside a 1-day window: must not be counted.
+        conn.execute(
+            "INSERT INTO token_ledger (ts, session, conversation, model, input, cache_read, cache_write, output, cost_usd, task) \
+             VALUES (?1, 'old', 'c9', 'claude-opus-5', 1, 1, 1, 1, 100.0, '')",
+            [now - 3 * 86_400],
+        ).unwrap();
+        let md = render_usage_report(&conn, 1, 25, now).unwrap();
+        assert!(md.starts_with("# Token usage, last 1 day(s)"), "{md}");
+        assert!(md.contains("$15.00 across 3 API responses"), "window excludes the old row: {md}");
+        assert!(md.contains("3 ledger rows in window of 4 total"), "population stated: {md}");
+        let worker = md.split("## By worker").nth(1).unwrap();
+        let studio = worker.find("studio-plg").unwrap();
+        let amux = worker.find("| amux |").unwrap();
+        assert!(studio < amux, "sorted by cost, the $9 worker first: {worker}");
+        assert!(md.contains("| subagent | $1.00 |"), "subagent vs main split: {md}");
+        assert!(!md.contains("| old |"), "the out-of-window worker is absent");
+        assert!(md.contains("## Known limits of these numbers"));
+        // Deterministic: the same ledger renders the same bytes.
+        assert_eq!(md, render_usage_report(&conn, 1, 25, now).unwrap());
     }
 }

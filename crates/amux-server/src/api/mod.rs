@@ -13,6 +13,7 @@ pub mod aliases;
 pub mod auth;
 pub mod board;
 pub mod board_intake;
+pub mod board_lifecycle;
 pub mod criteria;
 pub mod browser;
 pub mod browser_import;
@@ -40,9 +41,12 @@ pub mod gmail;
 pub mod graph;
 pub mod harness;
 pub mod history;
+pub mod history_ask;
 pub mod reports;
 pub mod terminal;
 pub mod invariants_api;
+pub mod brex;
+pub mod interactions;
 pub mod journal;
 pub mod layout_presets;
 pub mod log_search;
@@ -56,6 +60,7 @@ pub mod offline_origin;
 pub mod messages;
 pub mod org;
 pub mod prefs;
+pub mod recordings;
 pub mod policy;
 pub mod planning;
 pub mod proxies;
@@ -68,6 +73,7 @@ pub mod review;
 pub mod saved_messages;
 pub mod schedules;
 pub mod scope;
+pub mod screen;
 pub mod search;
 pub mod self_update;
 pub mod session_verbs;
@@ -160,6 +166,7 @@ pub fn router(state: AppState) -> Router {
         )
         .nest("/api/policy", policy::routes())
         .nest("/api/prefs", prefs::routes())
+        .nest("/api/brex", brex::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
         .nest("/api/reclaim", reclaim::routes())
@@ -201,6 +208,7 @@ pub fn router(state: AppState) -> Router {
         // LAST python-proxied family; its cutover emptied PROXIED_FAMILIES).
         .nest("/api/scope", scope::routes())
         .nest("/api/orchestrate", orchestrate::routes())
+        .nest("/api/board-lifecycle", board_lifecycle::routes())
         // Nothing proxies. py_proxy::PROXIED_FAMILIES is EMPTY post-AMUX-2608
         // and the forwarder it fed was deleted in AMUX-2906, so the merge that
         // used to sit here (already a no-op) is gone too — the registry, the
@@ -208,6 +216,11 @@ pub fn router(state: AppState) -> Router {
         // standing proof of the cutover. Matrix:
         // docs/rust-migration/server-boundary.md.
         .nest("/api/browser", browser::routes())
+        // Server-machine screen capture (AMUX-4661): a real macOS Screen
+        // Recording permission grant needs the OS's own native prompt, not a
+        // manually-added System Settings entry — see screen.rs header for why.
+        // Loopback-only; the fleet's remote/tunnel-facing paths don't reach it.
+        .nest("/api/screen", screen::routes())
         // File VIEWER family — NATIVE (AMUX-2598): payload + raw range
         // streaming + vtt + ffmpeg prepare/transcode with durable job state
         // (api/file_viewer.rs; was PROXIED_FAMILIES' /api/file namespace row).
@@ -281,8 +294,12 @@ pub fn router(state: AppState) -> Router {
         // Logs tab (AMUX-2605): python-shape /api/logs + /api/logs/raw over
         // the structured request log + tracing tail (api/request_log.rs).
         .nest("/api/logs", request_log::routes())
+        .merge(interactions::routes())
         .nest("/api/settings", settings::routes())
         .nest("/api/push", crate::push::routes())
+        // Record tab (AMUX-4624): device recordings synced into a folder and
+        // transcribed locally. The folder is the store; see the module docs.
+        .nest("/api/recordings", recordings::routes())
         .nest("/api/dictation", dictation::routes())
         // Transcription lives at the TOP-LEVEL /api/dictate (python parity);
         // the dictation module owns it and answers NATIVELY (AMUX-2598:
@@ -511,6 +528,8 @@ pub fn router(state: AppState) -> Router {
     // Synthesizes ONLY into an empty body: a handler that returned its own 405
     // with prose knows more than this layer does and must not be overwritten.
     let app = app.layer(axum::middleware::from_fn(explain_method_not_allowed));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        store_for_reqlog.clone(), interactions::middleware));
 
     // Transparent gzip compression for every response whose client sends
     // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,

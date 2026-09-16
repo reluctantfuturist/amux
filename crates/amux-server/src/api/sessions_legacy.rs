@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -853,6 +853,11 @@ pub struct FleetSignals {
     pub now: f64,
 }
 
+fn no_current_hook_report(report: Option<&Value>, started: f64) -> bool {
+    let ts=report.and_then(|r|r.get("ts")).and_then(Value::as_f64).unwrap_or(0.0);
+    ts <= 0.0 || ts < started
+}
+
 impl FleetSignals {
     pub fn load(conn: &rusqlite::Connection) -> Self {
         Self::load_scoped(conn, None)
@@ -1211,8 +1216,13 @@ impl FleetSignals {
             })
             .collect();
         let hookless_workers = running.iter().filter_map(|tmux| tmux.strip_prefix("amux-"))
-            .filter(|name| crate::config::parse_env_file(&amux_home().join("sessions").join(format!("{name}.env")))
-                .get("CC_PROVIDER").is_some_and(|provider| provider == "gemini"))
+            .filter(|name| {
+                let no_current_report = no_current_hook_report(reports.get(*name), started.get(*name).copied().unwrap_or(0.0));
+                // A fresh Claude worker has no Stop hook yet. Its recognized idle
+                // composer must stay observable after its last repaint ages out.
+                no_current_report || crate::config::parse_env_file(&amux_home().join("sessions").join(format!("{name}.env")))
+                    .get("CC_PROVIDER").is_some_and(|provider| provider == "gemini")
+            })
             .map(str::to_string).collect();
         FleetSignals {
             hookless_workers,
@@ -2853,30 +2863,88 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     let conn = store.dedicated_read()?;
     let arr = build_array(&conn)?;
     let json = serde_json::to_string(&arr)?;
-    if SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch_start
-        && registry_fingerprint() == registry_start
-    {
-        if let Ok(mut c) = build_array_cache().lock() {
-            *c = ListSnapshot {
-                store: store_key,
-                stamp: now,
-                json: json.clone(),
-                epoch: epoch_start,
-                runtime_epoch: runtime_epoch_start,
-                registry: registry_start,
-            };
+    match race_verdict(
+        epoch_start,
+        SESSIONS_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        registry_start,
+        registry_fingerprint(),
+    ) {
+        Ok(()) => {
+            if let Ok(mut c) = build_array_cache().lock() {
+                *c = ListSnapshot {
+                    store: store_key,
+                    stamp: now,
+                    json: json.clone(),
+                    epoch: epoch_start,
+                    runtime_epoch: runtime_epoch_start,
+                    registry: registry_start,
+                };
+            }
         }
-    } else {
-        // Fail closed as well as refusing the cache write. Returning JSON that
-        // predates an isolation/delete/config change would leak the old fleet
-        // shape to the one request that happened to race the change.
-        tracing::warn!(
-            target: "amux::sessions",
-            "session-list build raced a structural change — refusing the stale response"
-        );
-        anyhow::bail!("sessions list changed during discovery; retry")
+        Err(raced) => {
+            // Fail closed as well as refusing the cache write. Returning JSON that
+            // predates an isolation/delete/config change would leak the old fleet
+            // shape to the one request that happened to race the change.
+            tracing::warn!(
+                target: "amux::sessions",
+                "session-list build raced a structural change — refusing the stale response"
+            );
+            return Err(raced.into());
+        }
     }
     Ok(json)
+}
+
+/// The session-list build raced a structural change and refused to serve it.
+///
+/// AMUX-4637: this was a `bail!`, which every handler turned into a 500, so a
+/// documented, retryable race reached each 5xx sweep as a server fault
+/// (AMUX-4513, then AMUX-4637 once that card closed). The request was fine and
+/// the answer exists a moment later, so handlers answer 503 with Retry-After,
+/// the status the other readers of this projection (commit mentions, deleted
+/// substrate, session detail) already give a discovery failure. Display keeps
+/// the old message, which clients and tests quote.
+#[derive(Debug)]
+pub struct DiscoveryRaced;
+
+impl std::fmt::Display for DiscoveryRaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("sessions list changed during discovery; retry")
+    }
+}
+
+impl std::error::Error for DiscoveryRaced {}
+
+/// Serve a finished build only if neither the epoch nor the on-disk registry
+/// moved while it ran. Extracted so the construction of [`DiscoveryRaced`] is
+/// pinned by a test rather than only the classifier that reads it.
+fn race_verdict(
+    epoch_start: u64,
+    epoch_now: u64,
+    registry_start: u64,
+    registry_now: u64,
+) -> Result<(), DiscoveryRaced> {
+    if epoch_now == epoch_start && registry_now == registry_start {
+        Ok(())
+    } else {
+        Err(DiscoveryRaced)
+    }
+}
+
+/// 503 with `Retry-After: 1` for the discovery race, 500 for any other build
+/// failure, both as `{"error": message}`. Decided on the TYPE, so rewording the
+/// message cannot move the status.
+pub(crate) fn discovery_failure(e: &anyhow::Error, message: String) -> Response {
+    if e.downcast_ref::<DiscoveryRaced>().is_some() {
+        let mut r = (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": message }))).into_response();
+        r.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("1"),
+        );
+        r
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": message }))).into_response()
+    }
 }
 
 /// Parsed access to the shared sessions projection for sibling APIs.
@@ -2959,11 +3027,7 @@ pub async fn list_sessions_legacy(
             }
             (StatusCode::OK, h, body).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => discovery_failure(&e, e.to_string()),
     }
 }
 
@@ -3396,6 +3460,9 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         // conflating them reported 0 archived against a fleet with dozens.
         let archived = env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false)
             || blocked.contains(&name);
+        let paused = env.get("CC_PAUSED").map(|v| v == "1").unwrap_or(false);
+        // One label rule with the peer-interaction gate (AMUX-4566).
+        let lifecycle = crate::api::session_verbs::lifecycle_label(archived, paused);
         let flags = env.get("CC_FLAGS").cloned().unwrap_or_default();
         let backend = env
             .get("CC_BACKEND")
@@ -3455,6 +3522,7 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
         );
         out.push(json!({
             "archived": archived,
+            "lifecycle": lifecycle,
             // Why a `waiting` lane is waiting, and proof a lane is genuinely
             // busy: the dashboard renders both — a status with no visible
             // reason is a status nobody can act on (ethos rule 4).
@@ -3641,6 +3709,23 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
 /// pub(crate): session_verbs' bare GET /api/sessions/{name} serves ONE
 /// record from the SAME array (py:74892 — the natural URL answers the
 /// natural shape).
+fn steering_with_transport(conn: &rusqlite::Connection) -> rusqlite::Result<BTreeMap<String, Vec<Value>>> {
+    let mut steering: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    let mut stmt=conn.prepare("SELECT id, session, text, queued_at, COALESCE(guard,''),
+        (SELECT substr(msg_id,7) FROM send_dedup d WHERE d.session=steering_queue.session
+          AND d.receipt_id=steering_queue.id AND d.msg_id LIKE 'steer:%' LIMIT 1)
+        FROM steering_queue ORDER BY queued_at ASC")?;
+    let rows=stmt.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,
+        r.get::<_,f64>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?)))?;
+    for row in rows {
+        let (id,session,text,queued_at,guard,transport_id)=row?;
+        let system=crate::api::session_verbs::steer_guard_is_system(&guard);
+        steering.entry(session).or_default().push(json!({"id":id,"text":text,"queued_at":queued_at,
+            "guard":guard,"system":system,"transport_id":transport_id}));
+    }
+    Ok(steering)
+}
+
 fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::Value>> {
     let mut signals = FleetSignals::load(conn);
     // Before any status is derived: the pane is the only signal that can
@@ -3651,9 +3736,10 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
     let mut stmt = conn.prepare(
         "SELECT w.display_name, w.state, w.provider, w.model, w.cwd,
                 (SELECT COUNT(*) FROM _amux_sessions s
-                 WHERE s.worker_id = w.id AND s.ended_at IS NULL) AS live
+                 WHERE s.worker_id = w.id AND s.ended_at IS NULL) AS live,
+                w.lifecycle
          FROM _amux_workers w
-         WHERE json_extract(w.state, '$.deleted_at') IS NULL
+         WHERE w.lifecycle != 'deleted'
          ORDER BY w.display_name",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -3663,6 +3749,8 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
         let model: Option<String> = r.get(3)?;
         let cwd: String = r.get(4)?;
         let live: i64 = r.get(5)?;
+        let lifecycle: String = r.get::<_, Option<String>>(6)?.unwrap_or_else(|| "active".into());
+        let archived = lifecycle == "archived";
         Ok(json!({
             // The Python list's load-bearing fields; ones the Rust side
             // cannot honestly fill yet are present-and-empty, NOT omitted —
@@ -3670,6 +3758,8 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
             "name": name,
             "status": python_status(&state_json),
             "running": live > 0,
+            "archived": archived,
+            "lifecycle": lifecycle,
             "provider": provider,
             "model": model.unwrap_or_default(),
             "dir": cwd,
@@ -4045,33 +4135,11 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
     // in-memory queue's mirror. Entry shape matches Python's hydrate
     // (py:11873): {id, text, queued_at, guard} with guard "" for NULL.
     {
-        let mut steering: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session, text, queued_at, COALESCE(guard,'') \
-             FROM steering_queue ORDER BY queued_at ASC",
-        ) {
-            if let Ok(rows) = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, f64>(3)?,
-                    r.get::<_, String>(4)?,
-                ))
-            }) {
-                for (id, session, text, queued_at, guard) in rows.flatten() {
-                    // `system`: amux's own push (board-drive, sched:…), not a
-                    // human's queued message — the SPA separates the surfaces
-                    // and Clear-all spares these (AMUX-2922).
-                    let system =
-                        crate::api::session_verbs::steer_guard_is_system(&guard);
-                    steering.entry(session).or_default().push(json!({
-                        "id": id, "text": text, "queued_at": queued_at, "guard": guard,
-                        "system": system,
-                    }));
-                }
-            }
-        }
+        let steering=steering_with_transport(conn).map_err(|error| {
+            tracing::warn!(target:"amux::message_acceptance",verdict="steering_identity_read_failed",measured=false,n_considered=0,%error,
+                "Steering snapshot unavailable; refusing to report an empty queue");
+            error
+        })?;
         for v in out.iter_mut() {
             if let Some(name) = v["name"].as_str() {
                 if let Some(q) = steering.get(name) {
@@ -4353,6 +4421,27 @@ fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<serde_json::
 pub(crate) mod tests {
     use super::*;
     static PROBE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn steering_transport_identity_joins_receipt_and_session_without_text_deduplication() {
+        let conn=crate::db::migrate::test_memdb_pub();
+        // A sessions snapshot uses a read-only pool, including before any send.
+        conn.pragma_update(None,"query_only","ON").unwrap();
+        assert!(steering_with_transport(&conn).unwrap().is_empty());
+        conn.pragma_update(None,"query_only","OFF").unwrap();
+        conn.execute_batch("INSERT INTO steering_queue(id,session,text,queued_at,guard) VALUES('row-1','lane','same',1,''),('row-2','lane','same',2,''),('system','lane','system',3,'board-drive');
+            INSERT INTO send_dedup(session,msg_id,ts,receipt_id) VALUES('lane','steer:transport-1',1,'row-1'),('other','steer:wrong-lane',1,'row-2');").unwrap();
+        conn.pragma_update(None,"query_only","ON").unwrap();
+        let rows=steering_with_transport(&conn).unwrap();
+        assert_eq!(rows["lane"].len(),3);
+        assert_eq!(rows["lane"][0]["transport_id"],"transport-1");
+        assert!(rows["lane"][1]["transport_id"].is_null());
+        assert_eq!(rows["lane"][2]["system"],true);
+        conn.pragma_update(None,"query_only","OFF").unwrap();
+        conn.execute("ALTER TABLE steering_queue RENAME COLUMN text TO missing_text",[]).unwrap();
+        conn.pragma_update(None,"query_only","ON").unwrap();
+        assert!(steering_with_transport(&conn).is_err(),"unmeasured must not be an empty queue");
+    }
 
     #[test]
     fn single_lane_fleet_probe_targets_the_active_window() {
@@ -5579,6 +5668,23 @@ Claude usage limit reached. Your limit will reset at 3pm.
     }
 
     #[test]
+    fn fresh_claude_without_a_hook_keeps_its_quiet_composer_observable() {
+        let mut s=signals(); let lane="fresh-claude";
+        s.running.insert(format!("amux-{lane}"));
+        s.activity.insert(format!("amux-{lane}"),(s.now-7200.0) as i64);
+        assert!(no_current_hook_report(None,s.now-100.0));
+        assert!(no_current_hook_report(Some(&json!({"state":"idle","ts":s.now-200.0})),s.now-100.0));
+        assert!(!no_current_hook_report(Some(&json!({"state":"idle","ts":s.now-50.0})),s.now-100.0));
+        if no_current_hook_report(None,s.now-100.0) { s.hookless_workers.insert(lane.into()); }
+        s.panes.insert(lane.into(),"Claude Code\n❯ \n────────────────────\n⏵⏵ bypass permissions on (shift+tab to cycle) · ← 5 agents".into());
+        assert_eq!(s.turn_boundary_status(lane).as_deref(),Some("idle"));
+        s.panes.insert(lane.into(),WORKING_BAR.into());
+        assert_ne!(s.turn_boundary_status(lane).as_deref(),Some("idle"));
+        s.panes.insert(lane.into(),String::new());
+        assert!(s.turn_boundary_status(lane).is_none());
+    }
+
+    #[test]
     fn boundary_and_workers_share_structured_codex_truth_and_fail_closed() {
         let mut s = signals();
         let lane = "boundary";
@@ -6640,3 +6746,42 @@ Checked, nothing of mine was at risk, no action needed from you.
 #[cfg(test)]
 #[path = "status_chaos_tests.rs"]
 mod status_chaos_tests;
+
+#[cfg(test)]
+mod discovery_race_tests {
+    use super::*;
+
+    /// AMUX-4637: the race is 503 with Retry-After and keeps its message; any
+    /// other build failure stays 500.
+    #[tokio::test]
+    async fn a_discovery_race_is_503_with_retry_after_and_other_failures_stay_500() {
+        // The construction site: a moved epoch or a moved registry is the race.
+        assert!(race_verdict(1, 1, 7, 7).is_ok());
+        assert!(race_verdict(1, 1, 7, 8).is_err(), "a registry change alone is a race");
+        let raced: anyhow::Error = race_verdict(1, 2, 7, 7).unwrap_err().into();
+
+        let r = discovery_failure(&raced, raced.to_string());
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers().get(axum::http::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(r.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "sessions list changed during discovery; retry");
+
+        // Wrapped in context, the way sessions-git reports it, it is still the race.
+        let wrapped = anyhow::Error::from(DiscoveryRaced).context("session list unavailable");
+        let r = discovery_failure(&wrapped, format!("{wrapped:#}"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // CONTROLS: the same words untyped, and an ordinary failure, stay 500
+        // with no Retry-After.
+        let untyped = anyhow::anyhow!("sessions list changed during discovery; retry");
+        let r = discovery_failure(&untyped, untyped.to_string());
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
+        let db = anyhow::anyhow!("database query failed");
+        assert_eq!(discovery_failure(&db, db.to_string()).status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}

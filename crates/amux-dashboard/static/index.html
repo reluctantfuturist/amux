@@ -106,6 +106,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
 <link id="hljs-theme" rel="stylesheet" crossorigin="anonymous" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/state/feedback.css">
 <!-- AMUX-BOOTSTRAP-BEGIN (see extraction note at top of file) -->
 <script>window._AMUX_S3_ICAL_URL="";window._AMUX_AUTH_TOKEN="";window._AMUX_HOME="";window._AMUX_POSTHOG_KEY="";window._AMUX_POSTHOG_HOST="https://us.i.posthog.com";window._AMUX_USER_EMAIL="";window._AMUX_USER_ID="";window._AMUX_UI_TOKEN="";window._AMUX_DEFAULT_MODEL="sonnet";window._AMUX_AUTH_WITHHELD=false;</script>
 <!-- AMUX-BOOTSTRAP-END -->
@@ -186,11 +187,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="chrome-tabs-bar" class="chrome-tabs-bar"></div>
 <div id="chrome-tab-frames" class="chrome-tab-frames"></div>
 <div class="header-row">
-  <div style="display:flex;gap:8px;align-items:center;">
-    <h1 id="brand-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;" onclick="openAbout()"><span id="brand-icon-header"></span><span id="brand-name-header">amux</span></h1>
-    <span id="conn-status" class="conn-status online" title="Connection status — click for disconnection history" onclick="showConnHistory()"></span>
+  <div class="header-brand" style="display:flex;gap:8px;align-items:center;">
+    <h1 role="button" tabindex="0" aria-label="About amux" title="About amux" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openAbout()}" id="brand-header" style="margin:0;cursor:pointer;display:flex;align-items:center;gap:6px;" onclick="openAbout()"><span id="brand-icon-header"></span><span id="brand-name-header">amux</span></h1>
+    <span role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showConnHistory()}" id="conn-status" class="conn-status online" title="Connection status — click for disconnection history" onclick="showConnHistory()"></span>
     <div style="position:relative;">
-      <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="background:none;border:none;cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
+      <button id="notif-btn" onclick="toggleNotifPanel()" title="Notifications" style="cursor:pointer;padding:2px 4px;font-size:1rem;opacity:0.7;line-height:1;position:relative;" aria-label="Notifications" aria-controls="notif-panel" aria-expanded="false">&#x1F514;<span id="notif-badge" class="notif-badge" style="display:none;">0</span></button>
       <div id="notif-panel" class="notif-panel">
         <div class="notif-panel-header">
           <span>Notifications</span>
@@ -205,12 +206,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
   </div>
-  <div style="display:flex;gap:8px;align-items:center;">
+  <div class="header-actions" style="display:flex;gap:8px;align-items:center;">
     <div id="org-switcher-wrap" style="display:none;"></div>
     <button class="btn-rate-limit" id="rate-limit-pill" title="Continue all limited workers" onclick="event.stopPropagation();openBulkActions()">
       <span id="rate-limit-pill-text">0 limited</span>
+      <span id="rate-limit-pill-count" aria-hidden="true">0</span>
     </button>
-    <div class="active-wrap">
+    <div class="active-wrap" style="display:none;">
       <button class="btn-active" id="active-btn" onclick="event.stopPropagation();toggleActiveDropdown()">
         <span class="active-dot"></span>
         <span class="active-count" id="active-count">0</span>
@@ -218,7 +220,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div class="active-dropdown" id="active-dropdown"></div>
     </div>
     <div class="header-add-wrap">
-      <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()">+</button>
+      <button class="header-add-btn" id="add-btn" onclick="event.stopPropagation();toggleAddMenu()" aria-label="Create or connect" title="Create or connect">+</button>
       <div class="header-add-menu" id="add-menu">
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openCreate()"><span class="mi">&#x2795;</span> New worker</div>
         <div class="card-menu-item" onclick="event.stopPropagation();closeAddMenu();openConnect()"><span class="mi">&#x1F517;</span> Connect tmux</div>
@@ -229,7 +231,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
     </div>
     <div class="settings-wrap">
-      <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()">&#x2699;</button>
+      <button class="settings-btn" id="settings-btn" onclick="event.stopPropagation();toggleSettings()" aria-label="Settings" title="Settings">&#x2699;&#xFE0F;</button>
       <div class="settings-menu" id="settings-menu">
         <div class="settings-tabs" id="settings-tabs">
           <button class="settings-tab-btn active" data-stab="account" onclick="event.stopPropagation();_settingsTab('account')">Account</button>
@@ -505,10 +507,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="settings-device-name" type="text" autocomplete="off"
               onchange="saveDeviceName(this.value)">
           </div>
+          <div class="settings-row" id="settings-geo-row" style="margin-top:8px;">
+            <button class="btn" id="settings-geo-btn" onclick="_settingsToggleGeo()"
+              title="Attach this device's location to messages you send from it"></button>
+          </div>
+          <div id="settings-geo-status" style="font-size:0.72rem;color:var(--dim);margin-top:5px;"></div>
         </div>
         </div>
         <div class="settings-sep"></div>
         <div class="settings-section" style="text-align:center;display:flex;flex-direction:column;gap:8px;">
+          <button class="btn" id="style-guide-btn" onclick="openStyleGuide()">Style guide</button>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openAbout();closeSettings()">About amux &amp; token stats</span>
           <span style="font-size:0.7rem;color:var(--dim);cursor:pointer;" onclick="openDevtools();closeSettings()">&#x1F6E0; Developer tools</span>
           <span id="logout-btn" style="font-size:0.7rem;color:var(--dim);cursor:pointer;display:none;" onclick="window.location='/api/cloud-logout'">&#x2192; Sign out</span>
@@ -525,6 +533,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-calendar" onclick="switchView('calendar')"><span class="tab-ico">🗓</span><span class="tab-lbl">Calendar</span></button>
   <button id="tab-scheduler" onclick="switchView('scheduler')"><span class="tab-ico">⏱</span><span class="tab-lbl">Scheduler</span></button>
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
+  <button id="tab-record" onclick="switchView('record')"><span class="tab-ico">🎙</span><span class="tab-lbl">Record</span></button>
   <button id="tab-mdai" onclick="switchView('mdai')"><span class="tab-ico">&#x2726;</span><span class="tab-lbl">MDAI</span></button>
   <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
   <button id="tab-email" onclick="switchView('email')"><span class="tab-ico">📥</span><span class="tab-lbl">Email</span></button>
@@ -580,6 +589,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 </div>
 <div id="pinned-notes-home" class="pinned-notes-home"></div>
 <div id="cards" class="cards"></div>
+<div id="paused-section"></div>
 <div id="archived-section"></div>
 </div>
 <div id="groups-view" style="display:none;">
@@ -677,6 +687,42 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </summary>
     <div id="scheduler-audit"></div>
   </details>
+</div>
+
+<!-- Record view (AMUX-4625): tap to record on this device; each second is
+     saved locally as it arrives and the recording syncs to the configured
+     folder when amux is reachable. -->
+<div id="record-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
+  <div class="recorder-wrap">
+    <div class="recorder-hero">
+      <button id="recorder-btn" class="recorder-btn" type="button" onclick="_recorderToggle()" aria-pressed="false" aria-label="Start recording">
+        <span class="recorder-btn-dot" aria-hidden="true"></span>
+      </button>
+      <div class="recorder-readout">
+        <div id="recorder-elapsed" class="recorder-elapsed">0:00</div>
+        <div class="recorder-level" aria-hidden="true"><div id="recorder-level-fill" class="recorder-level-fill"></div></div>
+        <div id="recorder-status" class="recorder-status" role="status" aria-live="polite">Tap to record. Each second is saved on this device as it records.</div>
+      </div>
+    </div>
+    <div class="recorder-sync-row">
+      <span id="recorder-sync-summary" class="recorder-sync-summary"></span>
+      <button class="btn" type="button" onclick="_recorderSync(true)">Sync now</button>
+    </div>
+    <div id="recorder-list" class="recorder-list"></div>
+    <details class="recorder-settings">
+      <summary>Settings</summary>
+      <div class="ui-field">
+        <label for="recorder-dir">Recordings folder on the amux machine</label>
+        <div class="recorder-dir-row">
+          <input id="recorder-dir" class="input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="~/Recordings">
+          <button class="btn primary" type="button" onclick="_recorderSaveDir()">Save</button>
+        </div>
+        <div id="recorder-dir-help" class="ui-help"></div>
+      </div>
+      <label class="recorder-check"><input id="recorder-location" type="checkbox" onchange="_recorderSetLocation(this.checked)"> Save my location with each recording</label>
+      <div id="recorder-transcriber" class="ui-help"></div>
+    </details>
+  </div>
 </div>
 
 <div id="files-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
@@ -1342,6 +1388,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div style="display:flex;gap:6px;margin-bottom:10px;flex-shrink:0;">
     <button class="msg-mode-btn active" id="msgmode-messages" onclick="_msgSetMode('messages')">Messages</button>
     <button class="msg-mode-btn" id="msgmode-trends" onclick="_msgSetMode('trends')">&#x1F4C8; Trends</button>
+    <!-- AMUX-4664: Trends can only answer what its theme list already names.
+         Ask is the open-ended half: any question, over these same messages. -->
+    <button class="msg-mode-btn" id="msgmode-ask" onclick="_msgSetMode('ask')">&#x1F4AC; Ask</button>
     <select id="trends-days" onchange="_trendsLoad()" style="display:none;font-size:0.8rem;padding:4px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);margin-left:auto;">
       <option value="7">Last 7 days</option>
       <option value="14">Last 14 days</option>
@@ -1363,13 +1412,29 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="btn" onclick="_msgsAllSessions=null;_messagesLoad(true)" title="Refresh" style="font-size:0.78rem;padding:5px 10px;min-height:44px;flex:0 0 auto;">&#x21BB;</button>
   </div>
   <div id="msgs-list" style="overflow-y:auto;flex:1;min-height:0;display:flex;flex-direction:column;gap:6px;-webkit-overflow-scrolling:touch;"></div>
+  <div id="ask-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+      <input class="input" id="ask-q" type="text" placeholder="Ask anything about these messages…"
+        onkeydown="if(event.key==='Enter')_askRun()" style="flex:1;min-width:200px;">
+      <select id="ask-days" class="input" style="max-width:140px;">
+        <option value="7">Last 7 days</option>
+        <option value="14" selected>Last 14 days</option>
+        <option value="30">Last 30 days</option>
+        <option value="90">Last 90 days</option>
+      </select>
+      <button class="btn primary" id="ask-go" onclick="_askRun()">Ask</button>
+      <button class="btn" id="ask-new" onclick="_askNewThread(false)" title="Start a new thread: follow-ups will not see the earlier questions">New</button>
+    </div>
+    <div id="ask-suggestions" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
+    <div id="ask-meta" style="font-size:0.72rem;color:var(--dim);margin-bottom:8px;"></div>
+    <div id="ask-answer" style="font-size:0.88rem;line-height:1.55;white-space:pre-wrap;word-break:break-word;"></div>
+  </div>
   <div id="trends-view" style="display:none;overflow-y:auto;flex:1;min-height:0;">
     <div id="trends-totals" class="review-totals"></div>
     <div id="trends-body"><div style="color:var(--dim);padding:20px;">Loading…</div></div>
   </div>
-  <div style="flex-shrink:0;padding-top:8px;text-align:center;">
-    <button class="btn" id="msgs-more-btn" style="display:none;font-size:0.78rem;" onclick="_messagesLoad(false)">Load older</button>
-  </div>
+  <!-- AMUX-4666: pages, not an endless "Load older". -->
+  <div id="msgs-pager" style="flex-shrink:0;padding-top:8px;display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;"></div>
 </div>
 
 <div id="terminal-view" style="display:none;flex-direction:column;flex:1;min-height:0;">
@@ -1472,10 +1537,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </style>
   <!-- Nav row -->
   <div class="bw-row" style="padding-top:8px;">
-    <select id="bw-backend" class="bw-in" style="min-width:104px;display:none;" onchange="_bwOnBackend()" title="How to run the browser — Playwright profiles, or your own Chrome over CDP">
-      <option value="">Playwright</option>
-      <option value="live">My Chrome</option>
+    <select id="bw-backend" class="bw-in" style="min-width:104px;max-width:100%;" onchange="_bwOnBackend()" aria-label="Browser operating system and device" title="Browser on the server machine">
+      <option value="">Desktop Chrome</option>
     </select>
+    <button id="bw-ios-stop" class="bw-btn" style="display:none;" onclick="_bwStopIos()">Stop Safari</button>
     <select id="bw-profile" class="bw-in" style="min-width:120px;" title="Profile — 'Auto' matches the URL to a logged-in profile">
       <option value="">Auto profile</option>
     </select>
@@ -1484,10 +1549,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn primary" onclick="_bwGo()">Go</button>
     <button id="bw-live-btn" class="bw-btn" onclick="_bwToggleLive()" title="Live auto-refresh">&#9658; Live</button>
     <button class="bw-btn" onclick="_bwScreenshot()" title="Snapshot">&#128247;</button>
-    <button class="bw-btn" onclick="_bwIdentify()" title="AF-496 — amux opens a SECOND Chrome beside your own and they look identical. This raises the amux one and draws a blue bar across it naming its profile.">&#128269; Which window?</button>
-    <button class="bw-btn" onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
-    <button class="bw-btn" onclick="_bwImportProfile()" title="Import cookies from Chrome, Firefox, etc.">&#8615; Import</button>
-    <button class="bw-btn" onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwIdentify()" title="AF-496 — amux opens a SECOND Chrome beside your own and they look identical. This raises the amux one and draws a blue bar across it naming its profile.">&#128269; Which window?</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwNewProfile()" title="Create a profile and sign in to it">&#43; Profile</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwImportProfile()" title="Import cookies from Chrome, Firefox, etc.">&#8615; Import</button>
+    <button class="bw-btn" data-bw-chrome onclick="_bwSaveProfile()" title="Register current site to a profile">&#128190; Save</button>
   </div>
   <!-- Status / logged-in indicator -->
   <div class="bw-row" style="padding-bottom:4px;">
@@ -1505,10 +1570,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="bw-btn" onclick="_bwScroll(-1)" title="Scroll up">&#9650;</button>
     <button class="bw-btn" onclick="_bwScroll(1)" title="Scroll down">&#9660;</button>
     <button id="bw-el-btn" class="bw-btn" onclick="_bwToggleElements()" title="Show clickable elements">&#9776; Elements</button>
-    <button id="bw-inspect-btn" class="bw-btn" onclick="_bwToggleInspect()" title="Console, network &amp; JS errors">&#128269; Inspect</button>
+    <button id="bw-inspect-btn" data-bw-chrome class="bw-btn" onclick="_bwToggleInspect()" title="Console, network &amp; JS errors">&#128269; Inspect</button>
   </div>
   <!-- Agent task row -->
-  <div class="bw-row">
+  <div class="bw-row" data-bw-chrome>
     <input id="bw-task" type="text" placeholder="Give the browser agent a task (autonomous, vision)&hellip;" class="bw-in" style="flex:1;min-width:180px;" onkeydown="if(event.key==='Enter')_bwAgentRun()">
     <button class="bw-btn primary" onclick="_bwAgentRun()">&#9658; Run agent</button>
     <button id="bw-agent-stop" class="bw-btn" style="display:none;" onclick="_bwAgentStop()">Stop</button>
@@ -1639,7 +1704,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <!-- Video player overlay -->
 <div id="video-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9999;flex-direction:column;align-items:center;justify-content:center;" onclick="if(event.target===this)_closeVideo()">
   <div id="vp-container" style="position:relative;width:90vw;max-width:1200px;">
-    <div id="vp-title" style="color:#fff;font-size:0.85rem;margin-bottom:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></div>
+    <div class="vp-heading"><div id="vp-title"></div><button onclick="_closeVideo()" aria-label="Close video" title="Close video">&#x2715;</button></div>
     <div style="position:relative;background:#000;border-radius:8px;overflow:hidden;">
       <video id="video-player" playsinline webkit-playsinline x-webkit-airplay="allow" airplay="allow" preload="metadata" style="width:100%;max-height:75vh;display:block;"></video>
       <!-- Loading/error overlay -->
@@ -1664,7 +1729,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <input id="vp-volume" type="range" min="0" max="1" step="0.05" value="1" oninput="_vpSetVolume(this.value)" style="width:70px;accent-color:var(--accent);cursor:pointer;">
           </div>
           <button onclick="_vpFullscreen()" style="background:none;border:none;color:#fff;font-size:0.9rem;cursor:pointer;padding:0;" title="Fullscreen">&#x26F6;</button>
-          <button onclick="_closeVideo()" style="background:none;border:none;color:rgba(255,255,255,0.6);font-size:1rem;cursor:pointer;padding:0;" title="Close">&#x2716;</button>
+
         </div>
       </div>
     </div>
@@ -1948,8 +2013,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
      routes it to the right workers → review → send. -->
 <div id="orch-overlay" class="edit-overlay" onclick="if(event.target===this)_orchClose()">
   <div class="edit-box orch-box">
-    <h3 style="display:flex;align-items:center;gap:8px;">&#x1F399;&#xFE0F; Orchestrate the fleet
-      <span style="font-size:0.68rem;font-weight:400;color:var(--dim);">speak or paste, then approve before it sends</span></h3>
+    <div class="orch-heading">
+      <h3>Orchestrate the fleet</h3>
+      <button class="btn" onclick="_orchClose()" aria-label="Close orchestrator">&#x2715;</button>
+    </div>
+    <p class="orch-subtitle">Speak or paste, then review before sending.</p>
 
     <!-- Step 1: record -->
     <div id="orch-step-record" class="orch-step">
@@ -2278,7 +2346,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <div class="peek-attach-bar" id="peek-attach-bar"></div>
         <!-- Input row -->
         <div class="ac-wrap peek-composer-input">
-          <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Type a message or drop a file..."
+          <textarea class="send-input" id="peek-cmd-input" rows="1" placeholder="Message…" aria-label="Message the worker"
             autocomplete="off" autocorrect="on" autocapitalize="sentences" spellcheck="true"
             enterkeyhint="enter" style="width:100%;"
             oninput="autoGrow(this);slashAcUpdate();cmdHistoryReset();_draftSaveDebounced(peekSession,this.value)" onkeydown="slashAcKeydown(event)"
@@ -2452,6 +2520,26 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
       <input type="date" id="peek-msgs-date-jump" class="amux-dp" onchange="_peekMsgsJumpToDate(this.value)" title="Jump to a date" style="font-size:0.8rem;padding:5px 7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);color-scheme:dark;">
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
+      <button class="btn" id="peek-ask-toggle" onclick="_peekAskToggle()" title="Ask a question about this worker's messages"
+        style="font-size:0.78rem;padding:4px 10px;flex:0 0 auto;">&#x1F4AC; Ask</button>
+    </div>
+    <!-- AMUX-4664: same question box as the global Messages tab, scoped to this worker. -->
+    <div id="peek-ask-panel" style="display:none;padding:0 10px 8px;">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+        <input class="input" id="peek-ask-q" type="text" placeholder="Ask anything about this worker’s messages…"
+          onkeydown="if(event.key==='Enter')_askRun(true)" style="flex:1;min-width:160px;">
+        <select id="peek-ask-days" class="input" style="max-width:130px;">
+          <option value="7">7 days</option>
+          <option value="14" selected>14 days</option>
+          <option value="30">30 days</option>
+          <option value="90">90 days</option>
+        </select>
+        <button class="btn primary" onclick="_askRun(true)">Ask</button>
+        <button class="btn" onclick="_askNewThread(true)" title="Start a new thread: follow-ups will not see the earlier questions">New</button>
+      </div>
+      <div id="peek-ask-suggestions" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;"></div>
+      <div id="peek-ask-meta" style="font-size:0.7rem;color:var(--dim);margin-top:8px;"></div>
+      <div id="peek-ask-answer" style="font-size:0.84rem;line-height:1.5;white-space:pre-wrap;word-break:break-word;margin-top:6px;"></div>
     </div>
     <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;"></div>
     <div id="pm-selbar" style="display:none;"></div>
@@ -3016,6 +3104,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <div id="explore-body" class="file-overlay-body" style="padding:0;overflow-y:auto;"></div>
 </div>
 
+<script src="/state/kernel.js"></script>
 <script src="/app.js"></script>
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>

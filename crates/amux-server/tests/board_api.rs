@@ -27,6 +27,7 @@ const EV: &str = "ran `cargo test -p amux-server`";
 fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) {
     std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
     std::env::set_var("AMUX_DONE_EVIDENCE_REQUIRED", "1");
+    pin_approval_policy();
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(Store::open(&dir.path().join("amux-test.db")).unwrap());
     let state = AppState {
@@ -39,12 +40,33 @@ fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) 
     (router(state), store, dir)
 }
 
+/// Pin the authorization categories, for the reason the done-gates below are
+/// pinned: `approval_types` falls back to the real `~/.amux/amux.env`, so this
+/// suite's result depended on the operator's own fleet policy.
+///
+/// Measured 2026-09-15: on a box whose global policy is
+/// `AMUX_APPROVAL_TYPES=budget,customer_outbound`,
+/// `creating_a_needsyou_card_needs_a_typed_ask_just_like_the_transition_does`
+/// failed with 409 `needsyou_outside_approval_policy` on its CONTROL — the leg
+/// that proves the gate did not simply ban needsyou creation outright. It
+/// passes on a default box, so this reads as a regression only for whoever
+/// configured a policy, which is the worst audience to hand a false red to.
+///
+/// `*` is the documented legacy default, so this restores what the assertions
+/// were written against rather than inventing a policy. The suite that does
+/// test a restricted policy, `command_approval_policy.rs`, sets its own value
+/// and runs in its own process, so the two cannot reach each other.
+fn pin_approval_policy() {
+    std::env::set_var("AMUX_APPROVAL_TYPES", "*");
+}
+
 fn app() -> (axum::Router, tempfile::TempDir) {
     // Pin the global done-link gate ON so this suite is hermetic (not dependent
     // on whether the real ~/.amux disables it): the gate tests here provide a
     // link where they reach done, and done_requires_an_asset_link asserts it.
     std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
     std::env::set_var("AMUX_DONE_EVIDENCE_REQUIRED", "1");
+    pin_approval_policy();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("amux-test.db")).unwrap();
     let state = AppState {
@@ -667,7 +689,7 @@ async fn patch_archived_round_trip_with_cross_lane_guard() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "archived": 1 })),
+        Some(json!({ "archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden" })),
         &[("X-Amux-Session", "lane-b")],
     )
     .await;
@@ -680,7 +702,7 @@ async fn patch_archived_round_trip_with_cross_lane_guard() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "archived": 1 })),
+        Some(json!({ "archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden" })),
         &[("X-Amux-Session", "lane-a")],
     )
     .await;
@@ -696,7 +718,7 @@ async fn patch_archived_round_trip_with_cross_lane_guard() {
         &app,
         "PATCH",
         &format!("/api/board/{id2}"),
-        Some(json!({ "archived": "true", "authorized_by": "ethan" })),
+        Some(json!({ "archived": "true", "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden", "authorized_by": "ethan" })),
         &[("X-Amux-Session", "lane-b")],
     )
     .await;
@@ -1874,7 +1896,7 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
     .await;
     let id = c["id"].as_str().unwrap().to_string();
 
-    // Untyped: refused, and the five types are IN the refusal so the reader
+    // Untyped: refused, and the accepted types are IN the refusal so the reader
     // does not have to go and find them (AF-112).
     let (st, _, v) = send(
         &app,
@@ -1887,7 +1909,7 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
     assert_eq!(v["code"], json!("needsyou_requires_ask_type"), "{v}");
     let types: Vec<&str> =
         v["ask_types"].as_array().unwrap().iter().map(|t| t["type"].as_str().unwrap()).collect();
-    assert_eq!(types, vec!["decision", "access", "credential", "external", "judgment"], "{v}");
+    assert_eq!(types, vec!["budget", "customer_outbound", "decision", "access", "credential", "external", "judgment"], "{v}");
 
     // A type outside the closed vocabulary is refused too, or the vocabulary
     // is decorative.
@@ -1947,6 +1969,77 @@ async fn needsyou_refuses_a_park_that_names_no_human_act() {
     let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
     assert_eq!(got["ask_type"], json!("decision"));
     assert!(got["ask_unblocks"].as_str().unwrap().contains("auto-reclaim"), "{got}");
+}
+
+/// The TAG door's twin of the test above (AMUX-4590). AF-318/AMUX-3929 closed
+/// the STATUS door; the `needs:you` TAG was a second, unvalidated door into the
+/// identical dispatch exclusions, reachable without ever touching `status`.
+///
+/// Live specimen, mvs-infra's board on 2026-09-14: a `todo` card literally
+/// titled "Fix Namespace Pollution" — the same archetype
+/// `needsyou_refuses_a_park_that_names_no_human_act` names above — carrying a
+/// bare `needs:you` tag with its reason written only in `source_ref` prose.
+#[tokio::test]
+async fn a_bare_needs_you_tag_is_refused_without_the_needsyou_status() {
+    let (app, _tmp) = app();
+    let c = create(
+        &app,
+        json!({
+            "title": "Fix Namespace Pollution",
+            "desc": "Customer-data-touching cleanup, outside the auto-fix allowlist.",
+        }),
+    )
+    .await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    // Tag-only PATCH, no `status` in the body at all: never reaches the
+    // status-transition block, so this is the gap in its purest form.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "tags": ["needs:you"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("needsyou_tag_requires_status"), "{v}");
+
+    // The card must be untouched by the refused write: still `todo`, no tag.
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["status"], json!("todo"), "{got}");
+    assert!(
+        got["tags"].as_array().map(|t| t.is_empty()).unwrap_or(true),
+        "a refused tag write must not land: {got}"
+    );
+
+    // Same shape at creation: POST with `status` left at `todo`.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({ "title": "Another one", "tags": ["needs:you"], "status": "todo" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("needsyou_tag_requires_status"), "{v}");
+
+    // The sanctioned path is unaffected: tag and status together, with a real
+    // typed ask, still parks the card exactly as it did before this gate.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "needsyou", "gate_ack": true, "tags": ["needs:you"],
+            "ask_actor": "Ethan", "ask_type": "decision",
+            "ask_question": "OK to delete these namespaces?",
+            "ask_unblocks": "Ethan approves the candidate list",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["status"], json!("needsyou"), "{got}");
 }
 
 /// The ask survives a transition that a DIFFERENT gate refuses.
@@ -3167,7 +3260,7 @@ async fn cross_lane_archive_guard_sees_x_amux_worker_callers() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "archived": 1 })),
+        Some(json!({ "archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden" })),
         &[("x-amux-worker", "lane-b")],
     )
     .await;
@@ -3189,7 +3282,7 @@ async fn cross_lane_archive_guard_sees_x_amux_worker_callers() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "archived": 1 })),
+        Some(json!({ "archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden" })),
         &[("x-amux-worker", "lane-a")],
     )
     .await;
@@ -3415,7 +3508,7 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": ack })),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
         &[("X-Amux-Session", "amux-frustrations")],
     )
     .await;
@@ -3447,7 +3540,7 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": ack })),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
         &[("X-Amux-Session", "amux")],
     )
     .await;
@@ -3472,7 +3565,7 @@ async fn a_gate_that_asks_you_to_name_the_peer_refuses_until_a_peer_is_named() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": ack })),
+        Some(json!({ "status": "verified", "gate_checked": ack, "evidence": EV })),
         &[("X-Amux-Session", "amux-frustrations")],
     )
     .await;
@@ -5131,7 +5224,7 @@ async fn count_agrees_with_the_list_and_is_not_shaped_like_one() {
         if arch == 1 {
             let id = c["id"].as_str().expect("created id");
             let (st, _, v) =
-                send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({"archived": 1, "authorized_by": "lifecycle fixture owner"}))).await;
+                send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({"archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden", "authorized_by": "lifecycle fixture owner"}))).await;
             assert_eq!(st, StatusCode::OK, "archive c{i} failed: {v}");
         }
     }
@@ -5207,7 +5300,7 @@ async fn archiving_a_trigger_bearing_card_records_that_it_de_arms_it() {
     assert_eq!(v["source_ref"], json!("when the content_hash deploy lands"), "{v}");
 
     let (st, _, v) =
-        send(&app, "PATCH", &format!("/api/board/{armed_id}"), Some(json!({"archived": 1, "authorized_by": "lifecycle fixture owner"}))).await;
+        send(&app, "PATCH", &format!("/api/board/{armed_id}"), Some(json!({"archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden", "authorized_by": "lifecycle fixture owner"}))).await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let log = v["log"].as_str().unwrap_or_default();
     assert!(log.contains("DE-ARMS"), "the log must say archiving de-arms it: {log}");
@@ -5221,7 +5314,7 @@ async fn archiving_a_trigger_bearing_card_records_that_it_de_arms_it() {
     let plain = create(&app, json!({"title": "plain", "session": "lane"})).await;
     let plain_id = plain["id"].as_str().unwrap();
     let (_, _, pv) =
-        send(&app, "PATCH", &format!("/api/board/{plain_id}"), Some(json!({"archived": 1, "authorized_by": "lifecycle fixture owner"}))).await;
+        send(&app, "PATCH", &format!("/api/board/{plain_id}"), Some(json!({"archived": 1, "archive_outcome": "Retiring this temporary lifecycle fixture; no production work is hidden", "authorized_by": "lifecycle fixture owner"}))).await;
     let plog = pv["log"].as_str().unwrap_or_default();
     assert!(plog.contains("ARCHIVED"), "it still records the archive: {plog}");
     assert!(!plog.contains("DE-ARMS"), "but must not warn about a trigger it does not have: {plog}");
@@ -5338,7 +5431,7 @@ async fn verified_refuses_a_blanket_ack_and_takes_the_enumeration() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_ack": true })),
+        Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "blanket ack must be refused: {v}");
@@ -5367,7 +5460,7 @@ async fn verified_refuses_a_blanket_ack_and_takes_the_enumeration() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_checked": gate })),
+        Some(json!({ "status": "verified", "gate_checked": gate, "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "enumerated ack must be accepted: {v}");
@@ -5389,7 +5482,7 @@ async fn the_blanket_ack_refusal_is_narrow_by_design() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_ack": true })),
+        Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "single-criterion gate must still take an ack: {v}");
@@ -5437,10 +5530,55 @@ async fn the_contract_publishes_every_machine_checked_constraint() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "verified", "gate_ack": true })),
+        Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV })),
     )
     .await;
     assert_eq!(refused["code"], "verified_requires_gate_checked");
+}
+
+/// AMUX-4657: `verified` asks for the evidence `done` asks for. The rule bound
+/// the done target only, so a card that never passed done reached verified
+/// with evidence null: mixpeek-homepage-claude saw done refuse MHC-844..847 for
+/// missing evidence, then `amux board verified --checked ...` moved the same
+/// cards from backlog to verified. This card is a one-criterion investigation,
+/// so a blanket ack clears its verified gate and the evidence rule is the only
+/// thing left that can refuse it.
+#[tokio::test]
+async fn verified_requires_the_evidence_done_requires() {
+    let (app, _tmp) = app();
+    let c = create(&app, json!({ "title": "looked again", "type": "investigation", "status": "backlog" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    assert_eq!(c["status"], json!("backlog"), "{c}");
+    let url = format!("/api/board/{id}");
+
+    let (st, _, v) = send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_requires_evidence"), "{v}");
+    assert!(v["error"].as_str().unwrap_or("").starts_with("verified requires evidence"), "{v}");
+    assert!(
+        v["how_to_fix"]["cli"].as_str().unwrap_or("").starts_with(&format!("amux board verified {id} ")),
+        "the remedy names the verb that was refused: {v}"
+    );
+
+    let (st, _, v) =
+        send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true, "evidence": "implemented" }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_evidence_has_no_artifact"), "{v}");
+
+    let (st, _, v) =
+        send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true, "evidence": "none: n/a" }))).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("verified_evidence_none_unexplained"), "{v}");
+
+    let (st, _, v) = send(&app, "PATCH", &url, Some(json!({ "status": "verified", "gate_ack": true, "evidence": EV }))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("verified"), "{v}");
+
+    let (st, _, contract) = send(&app, "GET", "/api/board/contract", None).await;
+    assert_eq!(st, StatusCode::OK);
+    let rule = &contract["done_requires_evidence"];
+    assert!(rule["enforced"].as_str().unwrap_or("").contains("done or verified"), "{rule}");
+    assert_eq!(rule["codes"]["verified"][0], json!("verified_requires_evidence"), "{rule}");
 }
 
 // ---- full export (AMUX-3868) ---------------------------------------------
@@ -6005,7 +6143,7 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
     let second = vec!["Report total equals 42", "Peer checked malformed input", "Duplicate invoices are rejected"];
     let card = create(&app, json!({"title":"gate revision acceptance", "type":"chore", "gate": first})).await;
     let path = format!("/api/board/{}", card["id"].as_str().unwrap());
-    let (st, _, result) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "gate_checked":first}))).await;
+    let (st, _, result) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "evidence":EV, "gate_checked":first}))).await;
     assert_eq!(st, StatusCode::OK, "{result}");
     let (_, _, initial) = send(&app, "GET", &path, None).await;
     assert_eq!(initial["verification"]["gate_matches"], true);
@@ -6015,9 +6153,9 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
     assert_eq!(revised["status"], "verified", "preserve historical status while naming stale coverage");
     assert_eq!(revised["verification"]["state"], "needs_reverification");
     assert_eq!(revised["verification"]["gate_snapshot"], json!(first));
-    let (st, _, refused) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "reverify":true, "gate_checked":first}))).await;
+    let (st, _, refused) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "evidence":EV, "reverify":true, "gate_checked":first}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "recheck must enforce amended criteria: {refused}");
-    let (st, _, checked) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "reverify":true, "gate_checked":second}))).await;
+    let (st, _, checked) = send(&app, "PATCH", &path, Some(json!({"status":"verified", "evidence":EV, "reverify":true, "gate_checked":second}))).await;
     assert_eq!(st, StatusCode::OK, "{checked}");
     let (_, _, rechecked) = send(&app, "GET", &path, None).await;
     assert_eq!(rechecked["verification"]["state"], "current");
@@ -6025,11 +6163,300 @@ async fn changed_verified_gate_preserves_history_and_rejects_the_old_checklist()
 
     let other = create(&app, json!({"title":"new gate acceptance", "type":"chore", "gate":second})).await;
     let other_path = format!("/api/board/{}", other["id"].as_str().unwrap());
-    let (st, _, refused) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "gate_checked":first}))).await;
+    let (st, _, refused) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "evidence":EV, "gate_checked":first}))).await;
     assert_eq!(st, StatusCode::CONFLICT, "{refused}");
     assert_eq!(refused["missing"], json!(["Duplicate invoices are rejected"]));
-    let (st, _, result) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "gate_checked":second}))).await;
+    let (st, _, result) = send(&app, "PATCH", &other_path, Some(json!({"status":"verified", "evidence":EV, "gate_checked":second}))).await;
     assert_eq!(st, StatusCode::OK, "{result}");
     let (_, _, checked) = send(&app, "GET", &other_path, None).await;
     assert_eq!(checked["verification"]["state"], "current");
+}
+
+fn capture_wip_fixture() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) {
+    let (app, store, dir) = app_with_store();
+    store.write(|conn| {
+        // Seed both rows directly so create's capture-folding cannot erase the
+        // specimen before the claim path under test sees it.
+        conn.execute_batch(
+            "INSERT INTO issues (id,title,\"desc\",status,session,type,creator,owner_type,created,updated)
+             VALUES ('WC-1','Unanswered prompt','**Prompt:** keep working','doing','capture-wip-api','code','amux','agent',1000,1000),
+                    ('WC-2','Real next task','SCOPE: fix the parser','todo','capture-wip-api','code','capture-wip-api','agent',1001,1001);"
+        )?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    (app, store, dir)
+}
+
+/// AMUX-3757: manual claims must use the same WIP exemption as pickup.
+#[tokio::test]
+async fn capture_shell_does_not_block_patch_claim_but_reshaped_work_does() {
+    let (app, store, _dir) = capture_wip_fixture();
+    let (st, _, body) = send_with(
+        &app, "PATCH", "/api/board/WC-2",
+        Some(json!({"status":"doing", "gate_ack":true})),
+        &[("X-Amux-Worker", "capture-wip-api")],
+    ).await;
+    assert_eq!(st, StatusCode::OK, "an unanswered capture must not block PATCH: {body}");
+    let (_, _, capture) = send(&app, "GET", "/api/board/WC-1", None).await;
+    assert_eq!(capture["status"], json!("doing"), "exemption must not discard the prompt");
+    assert_eq!(capture["desc"], json!("**Prompt:** keep working"));
+
+    store.write(|conn| {
+        conn.execute("UPDATE issues SET status='todo' WHERE id='WC-2'", [])?;
+        conn.execute("UPDATE issues SET \"desc\"='SCOPE: implement the first task' WHERE id='WC-1'", [])?;
+        Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+    }).unwrap();
+    let (st, _, body) = send_with(
+        &app, "PATCH", "/api/board/WC-2",
+        Some(json!({"status":"doing", "gate_ack":true})),
+        &[("X-Amux-Worker", "capture-wip-api")],
+    ).await;
+    assert_eq!(st, StatusCode::CONFLICT, "reshaped work must retain WIP: {body}");
+    assert_eq!(body["holding"], json!(["WC-1"]));
+    let (_, _, next) = send(&app, "GET", "/api/board/WC-2", None).await;
+    assert_eq!(next["status"], json!("todo"), "a refused claim must not mutate status");
+}
+
+#[tokio::test]
+async fn capture_shell_frontier_and_status_claim_agree_with_patch() {
+    let (app, _store, _dir) = capture_wip_fixture();
+    let (st, _, ready) = send(&app, "GET", "/api/board/ready?session=capture-wip-api", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ready["measured"], json!(true), "{ready}");
+    assert_eq!(ready["wip"]["holding"], json!([]), "frontier must exempt the same capture: {ready}");
+    assert_eq!(ready["wip"]["available"], json!(1), "{ready}");
+    assert_eq!(ready["claimable_now"], json!(1), "the ready view must offer the real task: {ready}");
+    let (st, _, claim) = send_with(
+        &app, "POST", "/api/board/WC-2/status-update",
+        Some(json!({"text":"Implementing the parser now."})),
+        &[("X-Amux-Worker", "capture-wip-api")],
+    ).await;
+    assert_eq!(st, StatusCode::OK, "{claim}");
+    assert_eq!(claim["claimed"], json!(true), "status update must agree with the frontier: {claim}");
+    assert_eq!(claim["status"], json!("doing"));
+}
+
+// ---- RR-0052 Invariant 1: every holding of a card is a recorded attempt ----
+
+/// PATCH a status as `lane`, acking whatever gate the board names. The gate is
+/// not under test here; the lease and attempt bookkeeping around it is.
+async fn move_as(app: &axum::Router, id: &str, status: &str, lane: &str) -> Value {
+    let path = format!("/api/board/{id}");
+    // The continuation contract gates `doing`; supply it rather than let a host
+    // pref decide this test.
+    let body = if status == "doing" {
+        json!({ "status": status, "next_action": "Do the scoped work now" })
+    } else {
+        json!({ "status": status })
+    };
+    let (st, _, v) = send_with(app, "PATCH", &path, Some(body.clone()), &[("X-Amux-Session", lane)]).await;
+    if st == StatusCode::OK {
+        return v;
+    }
+    assert_eq!(st, StatusCode::CONFLICT, "unexpected refusal moving {id} to {status}: {v}");
+    let gate = v["gate"].clone();
+    assert!(gate.is_array(), "only a gate refusal is expected here: {v}");
+    let mut acked = body;
+    acked["gate_checked"] = gate;
+    let (st, _, v) = send_with(app, "PATCH", &path, Some(acked), &[("X-Amux-Session", lane)]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    v
+}
+
+#[tokio::test]
+async fn each_claim_opens_an_attempt_and_each_exit_closes_it_with_an_outcome() {
+    let (app, _dir) = app();
+    let card = create(&app, json!({ "title": "attempted", "session": "lane-a",
+        "desc": "artifact: crates/amux-server/src/db/attempts.rs" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // Claim: a lease and a running attempt #1, on the list row and the detail.
+    move_as(&app, &id, "doing", "lane-a").await;
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["lease"]["holder"], json!("lane-a"), "{d}");
+    assert_eq!(d["lease"]["attempt"], json!(1), "{d}");
+    assert_eq!(d["attempts"].as_array().unwrap().len(), 1);
+    assert!(d["attempts"][0]["outcome"].is_null(), "a running attempt has no outcome yet");
+    let (_, _, list) = send(&app, "GET", "/api/board", None).await;
+    let row = list.as_array().unwrap().iter().find(|r| r["id"] == json!(id)).unwrap().clone();
+    assert_eq!(row["lease"]["attempt"], json!(1), "the list row carries the same attempt: {row}");
+
+    // Released back to todo: attempt 1 closes as `released`, the lease is gone.
+    move_as(&app, &id, "todo", "lane-a").await;
+    // Claimed again and submitted: attempt 2 closes as `review`.
+    move_as(&app, &id, "doing", "lane-a").await;
+    move_as(&app, &id, "review", "lane-a").await;
+
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert!(d.get("lease").is_none(), "a card in review holds no lease: {d}");
+    let got: Vec<(i64, String, String)> = d["attempts"].as_array().unwrap().iter().map(|a| (
+        a["attempt"].as_i64().unwrap(),
+        a["worker"].as_str().unwrap().to_string(),
+        a["outcome"].as_str().unwrap_or("RUNNING").to_string(),
+    )).collect();
+    assert_eq!(got, vec![
+        (1, "lane-a".to_string(), "released".to_string()),
+        (2, "lane-a".to_string(), "review".to_string()),
+    ], "{d}");
+}
+
+// ---- RR-0052 Invariant 2: only the holder moves a leased card -------------
+
+/// Every status move a non-holder worker can make on a leased card, including
+/// the ones core has no named transition for (doing -> backlog maps to Force in
+/// the PATCH door) and the ones core's six guarded arms never covered (release,
+/// discard). Run with enforcement ON because that is what server.env ships.
+#[tokio::test]
+async fn a_non_holder_worker_cannot_move_a_leased_card_except_by_audited_force() {
+    std::env::set_var("AMUX_LEASE_ENFORCE", "1");
+    let (app, _dir) = app();
+    let card = create(&app, json!({ "title": "held", "session": "lane-a",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+    move_as(&app, &id, "doing", "lane-a").await;
+
+    for target in ["todo", "backlog", "discarded", "review"] {
+        let (st, _, v) = send_with(
+            &app, "PATCH", &format!("/api/board/{id}"),
+            Some(json!({ "status": target, "reason": "taking it over" })),
+            &[("X-Amux-Session", "lane-b")],
+        ).await;
+        assert_eq!(st, StatusCode::CONFLICT, "lane-b moving a held card to {target}: {v}");
+        assert_eq!(v["error"], json!("lease_held"), "{v}");
+        assert_eq!(v["holder"], json!("lane-a"), "{v}");
+        assert!(v["exits"]["override_on_the_record"].as_str().unwrap().contains("--force"), "{v}");
+    }
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["status"], json!("doing"), "no refused move may land: {d}");
+    assert_eq!(d["lease"]["holder"], json!("lane-a"));
+
+    // The holder itself is not gated.
+    move_as(&app, &id, "todo", "lane-a").await;
+    move_as(&app, &id, "doing", "lane-a").await;
+
+    // The override exists and is recorded: attributed force with a reason.
+    let (st, _, v) = send_with(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({ "status": "todo", "force": true, "reason": "lane-a is gone, reassigning by hand" })),
+        &[("X-Amux-Session", "lane-b")],
+    ).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    let last = d["attempts"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["outcome"], json!("released"), "{d}");
+    assert_eq!(last["ended_by"], json!("lane-b"), "who ended the attempt is on the record: {d}");
+}
+
+// ---- RR-0052 Invariant 3: a worker receives one task, it does not browse ----
+
+#[tokio::test]
+async fn lease_next_hands_a_lane_one_task_then_the_same_one_then_says_why_there_is_none() {
+    let (app, _dir) = app();
+    // Refused without a worker identity, like /claim.
+    let (st, _, v) = send(&app, "POST", "/api/board/lease-next", None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+
+    let card = create(&app, json!({ "title": "Implement the leased unit", "session": "lane-l",
+        "desc": "SCOPE: work\n- [ ] do it", "next_action": "Implement the scoped work",
+        "type": "chore" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+    // Creation stamps `updated`; the pickup window excludes nothing this fresh.
+    let (st, _, v) = send_with(&app, "POST", "/api/board/lease-next", None, &[("X-Amux-Session", "lane-l")]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["verdict"], json!("leased"), "{v}");
+    assert_eq!(v["card"], json!(id), "{v}");
+    assert!(v["prompt"].as_str().is_some_and(|p| p.contains(&id)), "the prompt names the card: {v}");
+
+    // The lease is real: doing, held by the lane, attempt 1.
+    let (_, _, d) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(d["status"], json!("doing"), "{d}");
+    assert_eq!(d["lease"]["holder"], json!("lane-l"), "{d}");
+    assert_eq!(d["lease"]["attempt"], json!(1), "{d}");
+
+    // Asking again returns the SAME card: one worker, one task.
+    let (_, _, v) = send_with(&app, "POST", "/api/board/lease-next", None, &[("X-Amux-Session", "lane-l")]).await;
+    assert_eq!(v["verdict"], json!("already_holding"), "{v}");
+    assert_eq!(v["card"], json!(id), "{v}");
+    assert_eq!(v["drain"]["verdict"], json!("draining"), "{v}");
+
+    // Once the card leaves doing, nothing is runnable, and the answer says what remains.
+    move_as(&app, &id, "review", "lane-l").await;
+    let (_, _, v) = send_with(&app, "POST", "/api/board/lease-next", None, &[("X-Amux-Session", "lane-l")]).await;
+    assert_eq!(v["verdict"], json!("none"), "{v}");
+    assert!(v["card"].is_null(), "{v}");
+    assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()), "a none always carries a reason: {v}");
+    assert_eq!(v["drain"]["measured"], json!(true), "{v}");
+    assert_eq!(v["drain"]["verdict"], json!("waiting_on_review"), "{v}");
+}
+
+// ---- RR-0052 Invariant 5: the board says whether a lane is drained ----------
+
+#[tokio::test]
+async fn drain_reports_measured_verdicts_for_a_lane() {
+    let (app, _dir) = app();
+    let (st, _, v) = send(&app, "GET", "/api/board/drain?session=lane-d", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["measured"], json!(true), "{v}");
+    assert_eq!(v["n_considered"], json!(1), "{v}");
+    assert_eq!(v["lanes"][0]["verdict"], json!("drained"), "an empty lane is drained: {v}");
+
+    create(&app, json!({ "title": "Implement the drain unit", "session": "lane-d", "type": "chore",
+        "desc": "SCOPE: work\n- [ ] do it", "next_action": "Implement the scoped work" })).await;
+    let (_, _, v) = send(&app, "GET", "/api/board/drain?session=lane-d", None).await;
+    assert_eq!(v["lanes"][0]["verdict"], json!("draining"), "{v}");
+    assert_eq!(v["lanes"][0]["ready"], json!(1), "{v}");
+    assert_eq!(v["drained"], json!(0), "{v}");
+}
+
+// ---- AMUX-4526: review/done lists every unmet acceptance check at once -------
+
+#[tokio::test]
+async fn review_and_done_are_refused_with_every_unmet_check_listed_together() {
+    let (app, _dir) = app();
+    let dep = create(&app, json!({ "title": "the prerequisite", "session": "lane-p", "type": "chore",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let dep_id = dep["id"].as_str().unwrap().to_string();
+    let epic = create(&app, json!({ "title": "the parent", "session": "lane-p", "type": "chore",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let epic_id = epic["id"].as_str().unwrap().to_string();
+    let child = create(&app, json!({ "title": "an open child", "session": "lane-p", "type": "chore",
+        "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
+    let child_id = child["id"].as_str().unwrap().to_string();
+    // The epic link is a PATCH field (AMUX-2992); read it back so a link that
+    // did not take fails here rather than as a missing check below.
+    let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{child_id}"),
+        Some(json!({ "epic": epic_id })), &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (_, _, linked) = send_with(&app, "GET", &format!("/api/board/{child_id}"), None, &[]).await;
+    assert_eq!(linked["epic"], json!(epic_id), "{linked}");
+    let (st, _, _) = send_with(&app, "PATCH", &format!("/api/board/{epic_id}"),
+        Some(json!({ "depends_on": [dep_id] })), &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK);
+    move_as(&app, &epic_id, "doing", "lane-p").await;
+
+    let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{epic_id}"),
+        Some(json!({ "status": "review" })), &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("acceptance_checks_failed"), "{v}");
+    let checks: Vec<(String, String)> = v["missing"].as_array().unwrap().iter()
+        .map(|m| (m["check"].as_str().unwrap().to_string(), m["card"].as_str().unwrap_or("").to_string()))
+        .collect();
+    assert_eq!(checks, vec![
+        ("dependency_resolved".to_string(), dep_id.clone()),
+        ("children_terminal".to_string(), child_id.clone()),
+    ], "both unmet checks in ONE answer: {v}");
+
+    // Clear both: the prerequisite finishes (chore completes at done) and the
+    // child is discarded. The same move now passes the preflight.
+    move_as(&app, &dep_id, "doing", "lane-p").await;
+    let (st, _, v) = send_with(&app, "PATCH", &format!("/api/board/{dep_id}"),
+        Some(json!({ "status": "done", "evidence": EV, "gate_checked": ["Outcome recorded in the item (what happened, and why it is closed)"] })),
+        &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK, "prerequisite closes: {v}");
+    let (st, _, _) = send_with(&app, "PATCH", &format!("/api/board/{child_id}"),
+        Some(json!({ "status": "discarded", "force": true, "reason": "not needed after all" })),
+        &[("X-Amux-Session", "lane-p")]).await;
+    assert_eq!(st, StatusCode::OK);
+    let v = move_as(&app, &epic_id, "review", "lane-p").await;
+    assert_eq!(v["status"], json!("review"), "{v}");
 }

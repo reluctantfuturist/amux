@@ -5,6 +5,7 @@ import base from '../playwright.config';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { reapStaleTmp } from '../tmp-reap';
 
 const output = path.resolve(process.env.AMUX_LIFECYCLE_OUTPUT || 'test-results/lifecycle');
 const firstPort = Number(process.env.AMUX_LIFECYCLE_PORT || 19823);
@@ -12,7 +13,11 @@ const selected = process.argv.flatMap((arg, index, args) => arg.startsWith('--pr
   ? [arg.slice(10)] : arg === '--project' ? [args[index + 1]] : []);
 // A separate socket prevents read-only discovery from probing the live fleet.
 // macOS's long TMPDIR exceeds the Unix socket path limit once tmux appends its suffix.
-const socketRoot = () => fs.mkdtempSync(path.join(process.platform === 'darwin' ? '/tmp' : os.tmpdir(), 'amux-lc-'));
+const socketTmpRoot = process.platform === 'darwin' ? '/tmp' : os.tmpdir();
+// Clean up what previous (usually interrupted) runs left here before adding to
+// it — see e2e/tmp-reap.ts. 2,389 of these had accumulated on this box.
+reapStaleTmp(socketTmpRoot, 'amux-lc-');
+const socketRoot = () => fs.mkdtempSync(path.join(socketTmpRoot, 'amux-lc-'));
 export default defineConfig({
   ...base,
   testDir: '..',
@@ -28,7 +33,7 @@ export default defineConfig({
     ...server,
     command: `bash ${path.join(__dirname, 'serve.sh')}`,
     url: `https://localhost:${firstPort + index * 10}/health`,
-    env: { ...server.env, AMUX_RS_PORT: String(firstPort + index * 10), TMUX_TMPDIR: socketRoot() },
+    env: { ...server.env, AMUX_LIFECYCLE_BROWSER_TTL_S: process.env.AMUX_LIFECYCLE_BROWSER_TTL_S || '', AMUX_RS_PORT: String(firstPort + index * 10), TMUX_TMPDIR: socketRoot() },
   })).filter((_, index) => !selected.length || selected.includes(base.projects![index].name!)),
   outputDir: path.join(output, 'browser-artifacts'),
   reporter: [

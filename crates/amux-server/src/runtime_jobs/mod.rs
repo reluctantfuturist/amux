@@ -48,10 +48,13 @@
 //!   3: the honest refusal beats the quiet lie).
 
 pub mod autofix;
+pub mod board_drain;
 pub mod board_drive;
 pub mod board_hygiene;
+pub mod message_capture;
 pub mod browser_reaper;
 pub mod cdc_poller;
+pub mod codex_ledger;
 pub mod commit_mention_notes;
 pub mod commit_nudge;
 pub mod context_health;
@@ -60,15 +63,19 @@ pub mod disk_watch;
 pub(crate) mod executor;
 pub mod ghost_rescue;
 pub mod heartbeat;
+pub mod host_metrics;
 pub mod mac_health;
+mod memory_consumers;
 pub mod pane_size;
 /// The live registry of the jobs below — see [`registry`] for why it is
 /// derived from the spawn sites rather than declared alongside them.
 pub mod queue_disposition;
+pub mod recordings_transcribe;
 pub mod registry;
 mod poll_watch;
 pub mod scheduler;
 pub mod storage;
+mod log_retention;
 pub mod tailnet_watch;
 pub mod telegram_poll;
 pub mod telegram_relay;

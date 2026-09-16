@@ -4,12 +4,17 @@
     --text: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
     --green: #3fb950; --red: #f85149; --yellow: #d29922;
     --cyan: #39d2c0;
+    --on-accent: #0d1117;
+    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px; --space-6: 24px;
+    --radius-control: 8px; --radius-dialog: 12px; --layer-dialog: 1100; --layer-confirmation: 1200;
+    --control-height: 40px; --control-font: 0.9rem;
   }
+  body { --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
   body.light {
     --bg: #ffffff; --card: #f6f8fa; --border: #d0d7de;
     --text: #1f2328; --dim: #656d76; --accent: #0969da;
     --green: #1a7f37; --red: #cf222e; --yellow: #9a6700;
-    --cyan: #0550ae;
+    --cyan: #0550ae; --on-accent: #fff;
   }
   body.light .board-sortable-ghost { background: rgba(9,105,218,0.08) !important; }
   body.light .log-line { filter: none; }
@@ -208,6 +213,66 @@
   .card-menu-item .mi { width: 18px; text-align: center; flex-shrink: 0; font-size: 0.85rem; }
   .card-menu-item.danger { color: var(--red); }
   .card-menu-sep { height: 1px; background: var(--border); }
+
+  /* Archived sessions */
+  #archived-section { padding: 0 12px 12px; }
+  /* Paused sits directly above Archived, below the worker cards (Ethan,
+     2026-09-14), so it takes Archived's side padding and spaces itself from the
+     cards above rather than below. */
+  #paused-section { padding: 0 12px; }
+  .paused-footer {
+    display: flex; align-items: center; gap: 8px;
+    padding: 9px 12px; border-radius: 8px; cursor: pointer;
+    border: 1px solid #d29922; color: #d29922;
+    font-size: 0.82rem; font-weight: 600; user-select: none; margin-top: 8px;
+    background: var(--card);
+  }
+  .paused-footer:hover { border-color: #e5a825; }
+  .paused-chevron { font-size: 0.65rem; transition: transform 0.15s; color: #d29922; }
+  .paused-chevron.open { transform: rotate(90deg); }
+  .paused-body { margin-top: 6px; display: flex; flex-direction: column; gap: 5px; }
+  .paused-card {
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 8px 11px; border-radius: 8px; border: 1px solid color-mix(in srgb, #d29922 40%, var(--border));
+    background: var(--card); font-size: 0.8rem;
+  }
+  .paused-card-top { display: flex; align-items: center; gap: 7px; min-width: 0; flex-wrap: wrap; }
+  .paused-card-name { font-weight: 600; color: var(--text); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .paused-card-name:hover { color: #d29922; }
+  .paused-card-chip {
+    font-size: 0.63rem; padding: 1px 6px; border-radius: 9px; flex-shrink: 0;
+    background: var(--bg); border: 1px solid var(--border); color: var(--dim); white-space: nowrap;
+  }
+  .paused-card-chip.model { color: var(--cyan, #39d2c0); }
+  .paused-card-spacer { flex: 1; min-width: 8px; }
+  .paused-card-meta {
+    color: var(--dim); font-size: 0.7rem; display: flex; gap: 5px 10px; flex-wrap: wrap;
+    align-items: center; min-width: 0;
+  }
+  .paused-card-tag { color: #d29922; font-size: 0.68rem; }
+  .paused-card-preview {
+    color: var(--dim); font-size: 0.72rem; line-height: 1.4; min-width: 0;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .paused-card-actions { display: flex; gap: 4px; flex-shrink: 0; }
+  .paused-resume-btn {
+    padding: 3px 10px; border-radius: 5px; font-size: 0.75rem; border: 1px solid #d29922;
+    color: #d29922; background: transparent; cursor: pointer; white-space: nowrap; min-height: 28px;
+  }
+  .paused-resume-btn:hover { background: #d29922; color: #000; }
+  .paused-archive-btn {
+    padding: 3px 7px; border-radius: 5px; font-size: 0.75rem; border: 1px solid var(--border);
+    color: var(--dim); background: transparent; cursor: pointer; min-height: 28px;
+  }
+  .paused-archive-btn:hover { border-color: var(--red); color: var(--red); }
+  @media (max-width: 600px) {
+    .paused-card { padding: 10px 12px; gap: 6px; }
+    .paused-card-top { gap: 6px; }
+    .paused-card-name { font-size: 0.85rem; max-width: calc(100% - 120px); }
+    .paused-resume-btn { min-height: 44px; min-width: 44px; padding: 6px 14px; font-size: 0.82rem; }
+    .paused-archive-btn { min-height: 44px; min-width: 44px; padding: 6px 10px; font-size: 0.82rem; }
+    .paused-footer { min-height: 44px; padding: 10px 14px; font-size: 0.85rem; }
+  }
 
   /* Archived sessions */
   #archived-section { padding: 0 12px 12px; }
@@ -524,16 +589,16 @@
   .card.expanded .panel { display: block; }
   .panel-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
   .btn {
-    font-size: 0.85rem; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--border);
+    font-size: var(--control-font); padding: var(--space-2) 14px; border-radius: var(--radius-control); border: 1px solid var(--border);
     background: var(--card); color: var(--text); cursor: pointer; font-weight: 500;
     -webkit-tap-highlight-color: transparent;
-    min-height: 40px;
+    min-height: var(--control-height);
   }
   .btn:active { background: var(--border); }
-  .btn.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .btn.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
   .btn.danger { border-color: var(--red); color: var(--red); }
   .provider-btn { flex:1; font-size:0.82rem; padding:7px 10px; transition: all 0.15s; }
-  .provider-btn.selected { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  .provider-btn.selected { background:var(--accent); color:var(--on-accent); border-color:var(--accent); font-weight:600; }
   .chips { display: flex; gap: 6px; flex-wrap: nowrap; margin-bottom: 10px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; touch-action: pan-x; overscroll-behavior-x: contain; }
   .chips::-webkit-scrollbar { display: none; }
   .chip {
@@ -676,14 +741,14 @@
      flow content stacked at the page bottom (the "Edit event at the bottom of
      the screen" bug, 2026-07-16). */
   .modal-overlay {
-    position: fixed; inset: 0; z-index: 300;
+    position: fixed; inset: 0; z-index: var(--layer-dialog);
     background: rgba(0,0,0,0.55);
     display: none; align-items: center; justify-content: center;
     padding: 16px; padding-bottom: calc(16px + env(safe-area-inset-bottom));
   }
   .modal-overlay.active { display: flex; }
   .modal-overlay .modal {
-    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-dialog);
     width: 100%; max-width: 440px; max-height: min(86dvh, 640px);
     display: flex; flex-direction: column;
     box-shadow: 0 24px 64px rgba(0,0,0,0.5);
@@ -698,10 +763,10 @@
     cursor: pointer; min-width: 44px; min-height: 32px; line-height: 1;
   }
   .modal-body { padding: 14px 16px; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-  .modal-body .input {
+  .input, .modal-body .input {
     width: 100%; box-sizing: border-box; padding: 8px 10px;
-    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-    color: var(--text); font-size: 0.9rem; outline: none;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-control);
+    min-height: var(--control-height); color: var(--text); font-size: var(--control-font); outline: none;
   }
   .modal-body input[type=date].input, .modal-body input[type=time].input { width: auto; flex: 1; min-width: 0; }
   .modal-footer { padding: 12px 16px; border-top: 1px solid var(--border); flex-shrink: 0; }
@@ -753,7 +818,7 @@
   .map-modal-box .map-modal-actions,
   .queue-box .queue-actions,
   .amux-modal .amux-modal-foot {
-    position: sticky; bottom: 0; z-index: 3; flex-shrink: 0;
+    position: sticky; bottom: calc(-1 * var(--modal-pad)); z-index: 3; flex-shrink: 0;
     background: var(--card);
     border-top: 1px solid var(--border);
     /* 20px top margin, not 12px: the NEGATIVE bottom margin below pulls the
@@ -1440,6 +1505,9 @@
     border-bottom: 1px solid var(--border);
   }
   .header-row h1 { margin-bottom: 0; }
+  /* AMUX-4475 / AF-774: receipts belong inside Notifications. Keep the
+     primary header free of a separate Actions control. */
+  .header-row > #interaction-feedback { display: none; }
   .btn-create {
     font-size: 0.85rem; padding: 8px 14px; border-radius: 8px;
     border: 1px solid var(--accent); background: var(--accent); color: #fff;
@@ -1472,6 +1540,7 @@
     align-items: center; gap: 6px; font-variant-numeric: tabular-nums;
     -webkit-tap-highlight-color: transparent;
   }
+  #rate-limit-pill-count { display:none; }
   .btn-rate-limit.show { display: flex; }
   .btn-rate-limit:active { background: rgba(248,81,73,0.22); }
   .active-dropdown {
@@ -1575,14 +1644,33 @@
       content: ''; position: absolute; left: 50%; top: 50%;
       width: 44px; height: 44px; transform: translate(-50%, -50%);
     }
-    .header-row { gap: 4px; flex-wrap: nowrap; }
-    .header-row h1 { font-size: 1.1rem; flex-shrink: 0; }
-    /* overflow:hidden so a group that can't fit its own children (the bell
-       button next to the "Live" pill, both flex-shrink:0) clips at its OWN
-       boundary instead of bleeding into the sibling group and overlapping
-       the rate-limit pill's text (Ethan, phone screenshot, 2026-09-11). */
-    .header-row > div { gap: 6px !important; flex-shrink: 1; min-width: 0; overflow: hidden; }
-    .btn-rate-limit { max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 6px 8px; flex-shrink: 0; }
+  }
+  @media (max-width: 600px) {
+    /* AF-779: seven 44px targets + 12px edge padding fit even at 320px.
+       Keep one row through the full mobile breakpoint; spare width becomes
+       space between controls, rather than a second row or clipped actions. */
+    body { padding-top:max(var(--chrome-tab-h, 0px), env(safe-area-inset-top, 0px)); }
+    .header-row { gap:0; padding:6px max(6px, env(safe-area-inset-right, 0px)) 6px max(6px, env(safe-area-inset-left, 0px)); flex-wrap:nowrap; justify-content:space-between; }
+    .header-row > .header-brand, .header-row > .header-actions { display:contents !important; }
+    .header-row #brand-header, .header-row #conn-status, .header-row #notif-btn,
+    .header-row .header-add-btn, .header-row .settings-btn, .header-row .btn-active,
+    .header-row .btn-rate-limit { flex:0 0 44px; width:44px; min-width:44px; height:44px; min-height:44px; box-sizing:border-box; justify-content:center; padding:4px; }
+    .header-row #brand-header { font-size:1.25rem; }
+    .header-row #brand-icon-header { display:none; }
+    .header-row #brand-name-header { font-size:0; }
+    .header-row #brand-name-header::after { content:'a'; font-size:1.25rem; }
+    .header-row #conn-status { display:flex; font-size:0; gap:0; background:transparent; transition:color .2s,background-color .2s; }
+    .header-row #conn-status::before { width:12px; height:12px; margin:0; }
+    .header-row .active-wrap, .header-row .header-add-wrap, .header-row .settings-wrap { flex:0 0 auto; }
+    .header-row .btn-active { gap:3px; font-size:0.85rem; }
+    .header-row .btn-rate-limit { max-width:44px; overflow:visible; white-space:nowrap; }
+    .header-row #rate-limit-pill-text { display:none; }
+    .header-row #rate-limit-pill-count { display:inline-block; font-size:0.85rem; font-weight:600; }
+    .header-row > #interaction-feedback { flex:0 0 44px; margin-left:auto; }
+    .header-row > #interaction-feedback > summary { box-sizing:border-box; width:44px; height:44px; min-height:44px; padding:0; justify-content:center; }
+    .header-row > #interaction-feedback > summary > span { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
+    .header-row > #interaction-feedback > summary > svg:last-child { display:none; }
+
   }
 
   /* Header + dropdown */
@@ -1794,6 +1882,24 @@
     padding: 10px 0;
   }
   .settings-menu.open { display: block; }
+  /* MOBILE: the menu must ESCAPE the sticky .header-row stacking context.
+     .header-row is position:sticky; z-index:40, which traps an absolutely
+     positioned child: on a phone the dropdown painted BEHIND #session-view and
+     the whole menu was invisible (Ethan, 2026-09-12: "when I press the settings
+     button on mobile I don't see anything"). Verified: raising the menu's
+     z-index or the header's does nothing; only leaving the context (fixed)
+     works. Desktop keeps the absolute anchor, which is fine there. Anchored
+     under the gear, capped to the viewport, scrolls internally. */
+  @media (max-width: 600px) {
+    .settings-menu {
+      position: fixed;
+      top: var(--mobile-header-bottom, calc(max(var(--chrome-tab-h, 0px), env(safe-area-inset-top, 0px)) + 60px));
+      right: 8px; left: auto;
+      max-width: calc(100vw - 16px);
+      max-height: calc(100dvh - var(--mobile-header-bottom, 60px) - 12px);
+      z-index: 6000;
+    }
+  }
   /* AMUX-2975: the 17-section list is grouped into 5 tabs. The strip is sticky
      so it stays reachable while a panel scrolls, and overflow-x:auto so it never
      overflows the 260px menu on a 375px phone — it scrolls instead. */
@@ -2191,7 +2297,7 @@
   @media (max-width: 600px) {
     .peek-cmd-row > .send-split { margin-left: auto; }
     .peek-cmd-row .peek-more-menu,
-    .peek-cmd-row .dict-popup { left: 0; right: auto; }
+    .peek-cmd-row .dict-popup { left: auto; right: 0; }
     .peek-cmd-row .peek-more-menu {
       max-width: calc(100vw - 24px);
     }
@@ -2239,7 +2345,13 @@
      the button travels with the viewport.
      Padding on the scroll box gives the content somewhere to go — the last tab
      can now scroll clear of the button instead of stopping under it. */
-  .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 68px 0 12px;
+  /* right padding 0 so the sticky ⊞ pins to the TRUE right edge, flush like
+     the worker-list tab button (Ethan, 2026-09-12: "make this all the way on
+     the right just like the worker list page"). It used to be 68px, which
+     parked the button that far in from the edge on desktop. The button carries
+     its own background + border-left + shadow, so a tab scrolling under it at
+     the extreme right stays legible. */
+  .peek-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; padding: 0 0 0 12px;
     overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; scrollbar-width: none; -ms-overflow-style: none;
     overscroll-behavior-x: contain; touch-action: pan-x; }
   .peek-tabs::-webkit-scrollbar { display: none; }
@@ -2557,11 +2669,11 @@
   /* Kanban view of session issues: let the inner .board-columns scroll horizontally */
   .peek-tasks-list.peek-issues-kanban { overflow-y: auto; }
   .peek-tasks-list.peek-issues-kanban .board-columns { flex: 1; min-height: 0; }
-  .peek-issue-item { display: flex; align-items: flex-start; gap: 8px; padding: 8px 10px;
+  .peek-issue-item { display: flex; flex-shrink: 0; align-items: flex-start; gap: 8px; padding: 8px 10px;
     border-radius: 8px; border: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
   .peek-issue-item:hover { background: var(--hover); border-color: var(--accent); }
   .peek-issue-key { font-size: 0.72rem; color: var(--dim); font-family: monospace; flex-shrink: 0; margin-top: 2px; }
-  .peek-issue-title { flex: 1; font-size: 0.87rem; line-height: 1.45; word-break: break-word; }
+  .peek-issue-title { flex: 1; min-width: 0; font-size: 0.87rem; line-height: 1.45; word-break: break-word; }
   .peek-issue-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; flex-direction: column; align-items: flex-end; }
   .peek-issue-due { font-size: 0.72rem; color: var(--dim); }
 
@@ -2733,8 +2845,8 @@
   .sync-banner .sync-item { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 0.75rem; }
   .sync-banner .sync-item.pending { color: var(--dim); }
   .sync-banner .sync-item.running { color: var(--accent); }
-  .sync-banner .sync-item.done { color: #4ade80; }
-  .sync-banner .sync-item.failed { color: #f87171; }
+  .sync-banner .sync-item.done { color: var(--green); }
+  .sync-banner .sync-item.failed { color: var(--red); }
 
   /* Sending indicator */
   .sending-indicator {
@@ -2864,8 +2976,8 @@
 
   /* Notification panel */
   .notif-panel {
-    position: absolute; top: 100%; left: 0; z-index: 510;
-    width: 340px; max-height: 420px; overflow-y: auto;
+    position: fixed; top: 80px; left: 12px; z-index: 510;
+    width: min(340px, calc(100vw - 24px)); max-height: min(70dvh, 520px); overflow-y: auto; overscroll-behavior: contain;
     background: var(--card); border: 1px solid var(--border); border-radius: 10px;
     box-shadow: 0 8px 32px rgba(0,0,0,0.4);
     display: none; flex-direction: column;
@@ -2898,18 +3010,32 @@
   }
   @media (max-width: 600px) {
     .notif-banners { right: 8px; max-width: calc(100% - 16px); }
-    .notif-panel { width: calc(100vw - 24px); left: -120px; }
+    .notif-panel { width: calc(100vw - 24px); }
   }
 
   /* Confirm / alert modal — replaces native confirm()/alert() which PWA blocks */
   .modal-backdrop {
-    display: none; position: fixed; inset: 0; z-index: 600;
+    display: none; position: fixed; inset: 0; z-index: var(--layer-confirmation);
     background: rgba(0,0,0,0.6); align-items: center; justify-content: center;
+    padding: 16px 12px;
   }
   .modal-backdrop.open { display: flex; }
   .modal-box {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-    padding: 24px 20px 16px; max-width: min(480px, 94vw); width: 100%; text-align: center;
+    padding: 20px; max-width: min(480px, calc(100vw - 24px)); width: 100%; text-align: center;
+    max-height: calc(var(--dialog-viewport-height, 100dvh) - 32px);
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  }
+  .modal-box > .modal-msg, #bulk-actions-body {
+    min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch; overflow-wrap: anywhere;
+  }
+  .modal-box > .modal-btns, #bulk-actions-overlay .modal-box > :first-child { flex-shrink: 0; }
+  .modal-box input, .modal-box textarea, .modal-box select { min-width: 0; max-width: 100%; }
+  @media (max-width: 600px) {
+    .modal-box button { min-width: 44px; min-height: 44px; }
+    #dictm-pair { flex-wrap: wrap; }
+    #dictm-pair input { flex: 1 1 100px; width: 0; }
   }
   .modal-msg { font-size: 0.95rem; color: var(--text); margin-bottom: 20px; line-height: 1.5; }
   .modal-btns { display: flex; gap: 10px; justify-content: center; }
@@ -3128,6 +3254,14 @@
   }
   .tab-bar button.active { color: var(--accent); border-bottom-color: var(--accent); }
   .tab-bar button:active { opacity: 0.7; }
+  /* AMUX-4475 "weird blue highlighting": .tab-bar is overflow-x:auto, and per
+     the CSS overflow spec that forces overflow-y to auto too, so a focused tab's
+     focus ring has its top and bottom CLIPPED by the scroll box — what survives
+     is two stray blue vertical bars flanking the tab. Inset the ring so it draws
+     as a clean box inside the button and is never clipped; keep it keyboard-only
+     via :focus-visible so a mouse click leaves no ring at all. */
+  .tab-bar button:focus { outline: none; }
+  .tab-bar button:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; border-radius: 4px; }
   .tab-customize-wrap {
     position: relative; flex-shrink: 0; display: flex; align-items: center;
     padding: 0 10px; border-left: 1px solid var(--border);
@@ -3160,6 +3294,13 @@
      missing one hides the border or leaves a stray button in focus mode. */
   #peek-tab-customize {
     position: sticky; right: 0; z-index: 2;
+    /* FLUSH RIGHT in both regimes (Ethan, 2026-09-12). When the strip does not
+       overflow (wide desktop), sticky right:0 is inert and the button would sit
+       right after the last tab; margin-left:auto eats the free space and pushes
+       it to the edge, exactly like the worker-list `.tab-customize-wrap`. When
+       the strip DOES overflow there is no free space, margin-left:auto is 0, and
+       sticky keeps it pinned as you scroll. */
+    margin-left: auto;
     background: var(--bg);
     border-left: 1px solid var(--border);
     box-shadow: -10px 0 10px -8px rgba(0, 0, 0, 0.45);
@@ -3739,6 +3880,18 @@
     border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45); }
   .board-card-shepherd { font-size:0.62rem; padding:1px 6px; border-radius:4px; background:rgba(137,87,229,0.15);
     color:var(--purple,#8957e5); border:1px dashed rgba(137,87,229,0.5); }
+  /* LEASE (RR-0052 / AMUX-4529). Same chip shape as its neighbours because it
+     is the same class of fact: something about this card that decides whether
+     the advice on it is followable. Neutral while the hold is alive, red once
+     the lease has expired, because an expired hold and a healthy one looked
+     identical in the column. */
+  .board-card-lease { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;
+    border-radius:4px; background:rgba(88,166,255,0.12); color:var(--accent); border:1px solid rgba(88,166,255,0.35);
+    max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .board-card-lease-stale { background:rgba(224,85,91,0.15); color:#e0555b; border-color:rgba(224,85,91,0.45); }
+  .board-card-blocked { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;
+    border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45);
+    max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .board-card-rot { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;
     border-radius:4px; background:rgba(240,160,32,0.16); color:#f0a020; border:1px solid rgba(240,160,32,0.35); }
   .board-card {
@@ -3777,6 +3930,18 @@
   .board-card-live-label .board-live-dot { flex:0 0 auto; }
   @keyframes boardLivePulse { 0%,100% { opacity:1; } 50% { opacity:0.35; } }
   .board-card-live .board-card-session { color: var(--green,#3fb950); border-color: rgba(63,185,80,0.4); }
+  .board-activity { display:flex; gap:8px; overflow-x:auto; max-width:100%; padding:8px 2px; margin-bottom:8px; }
+  .board-activity[hidden] { display:none; }
+  .board-activity-item { display:flex; align-items:flex-start; gap:10px; flex:0 0 min(420px,92%); padding:10px 12px; border:1px solid rgba(63,185,80,0.45); border-radius:10px; background:var(--surface,var(--bg)); font-size:0.8rem; }
+  .board-activity-copy { min-width:0; flex:1; }
+  .board-activity-copy > span { color:var(--green,#3fb950); }
+  .board-activity-task { display:block; max-width:100%; padding:4px 0 0; border:0; background:none; color:var(--accent); text-align:left; cursor:pointer; font:inherit; overflow-wrap:anywhere; }
+  .board-activity-note { margin-top:4px; color:var(--dim); font-size:0.74rem; }
+  .board-activity-unlinked, .board-card-observed { border-color:var(--yellow,#d29922); box-shadow:0 0 0 1px rgba(210,153,34,0.2); }
+  .board-activity-unlinked .board-activity-copy > span, .board-card-observed .board-card-live-label { color:var(--yellow,#d29922); }
+  .board-card-observed .board-card-live-label { background:rgba(210,153,34,0.1); border-color:rgba(210,153,34,0.35); }
+  .peek-issue-item.board-card-live, .peek-issue-item.board-card-observed { border-radius:6px; }
+  @media (max-width:600px) { .board-activity-item { flex-direction:column; gap:6px; } }
   .board-pin-btn {
     position: absolute; top: 6px; right: 30px;
     width: 22px; height: 22px; padding: 0; border: none; background: none;
@@ -3784,10 +3949,10 @@
     transition: opacity 0.15s; border-radius: 4px;
     color: var(--dim); display: flex; align-items: center; justify-content: center;
   }
-  .board-card:hover .board-pin-btn { opacity: 0.7; }
+  @media (hover: hover) { .board-card:hover .board-pin-btn { opacity: 0.7; } }
   .board-pin-btn:hover { opacity: 1 !important; background: rgba(139,148,158,0.12); }
   .board-pin-btn.active { opacity: 0.8 !important; color: var(--accent); }
-  .board-card:hover .board-pin-btn.active { opacity: 1 !important; }
+  @media (hover: hover) { .board-card:hover .board-pin-btn.active { opacity: 1 !important; } }
   .board-drag-handle {
     position: absolute; top: 6px; right: 6px;
     width: 24px; height: 24px;
@@ -3797,10 +3962,12 @@
     border-radius: 4px;
     touch-action: none;
   }
-  .board-card:hover .board-drag-handle { opacity: 0.7; cursor: grab; }
+  @media (hover: hover) { .board-card:hover .board-drag-handle { opacity: 0.7; cursor: grab; } }
   .board-drag-handle:hover { opacity: 1 !important; cursor: grab; color: var(--fg); background: rgba(139,148,158,0.12); }
   .board-drag-handle:active { cursor: grabbing; }
-  @media (hover: none) { .board-drag-handle { opacity: 0.5; width: 32px; height: 32px; cursor: grab; } }
+  /* Safari consumes the first tap when hover reveals a hidden child. Touch
+     controls must already be visible so that tap opens the card. */
+  @media (hover: none) { .board-pin-btn { opacity: 0.7; } .board-drag-handle { opacity: 0.5; width: 32px; height: 32px; cursor: grab; } }
   /* ── Board mobile responsive ── */
   .board-new-btn { font-size: 0.8rem; padding: 5px 12px; white-space: nowrap; flex-shrink: 0; }
   .board-new-icon { display: none; }
@@ -5980,7 +6147,7 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 @media (max-width: 600px) { .conn-gmail-btn { min-height: 44px; } .conn-gmail-btn { margin-left: 0; flex: 1 1 auto; } }
 /* Scope picker: searchable dropdown over real workers/groups (AMUX-3350) */
 .conn-picker-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 10050; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; }
-.conn-picker { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; width: min(92vw, 420px); max-height: 70vh; display: flex; flex-direction: column; box-shadow: 0 8px 40px rgba(0,0,0,0.5); overflow: hidden; }
+.conn-picker { background: var(--card); border: 1px solid var(--border); border-radius: 12px; width: min(92vw, 420px); max-height: 70vh; display: flex; flex-direction: column; box-shadow: 0 8px 40px rgba(0,0,0,0.5); overflow: hidden; }
 .conn-picker-h { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
 .conn-picker-x { background: none; border: none; color: var(--dim); cursor: pointer; font-size: 1rem; }
 .conn-picker-search { margin: 10px 14px; padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--text); font-size: 0.9rem; outline: none; }
@@ -6344,4 +6511,184 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .peek-attach-chip button.chip-remove { border:0; padding:0; background:transparent; }
 @media (pointer: coarse) {
   #peek-overlay .send-input { font-size:16px; }
+}
+
+.card-file-picker { min-width:44px; min-height:44px; margin-bottom:4px; }
+
+/* AF-749: modal space is the visible viewport, including the software keyboard. */
+.amux-dialog-viewport {
+  top: var(--dialog-viewport-top, 0px) !important;
+  height: var(--dialog-viewport-height, 100dvh) !important;
+  bottom: auto !important;
+}
+.amux-dialog-viewport > :is(.edit-box,.board-edit-box,.queue-box,.map-modal-box,.amux-modal,.modal) {
+  max-height: calc(var(--dialog-viewport-height, 100dvh) - 40px) !important;
+}
+/* The board backdrop already reserves the warning's measured height in its
+   bottom padding. Preserve that reservation when keyboard sizing overrides
+   the board box's original max-height (AF-777). */
+.amux-dialog-viewport > .board-edit-box {
+  max-height: calc(var(--dialog-viewport-height, 100dvh) - 40px - var(--sw-fail-h, 0px)) !important;
+}
+.orch-heading { display:flex; align-items:center; gap:12px; justify-content:space-between; }
+.orch-heading h3 { margin:0; }
+.orch-heading button { flex-shrink:0; min-width:44px; min-height:44px; }
+.orch-subtitle { color:var(--dim); font-size:0.8rem; margin:8px 0 16px; }
+
+.amux-dialog-viewport:is(#team-scope-modal,#jrnl-config-overlay,#peek-lookup-modal,#conn-hist-modal) > div {
+  max-height: calc(var(--dialog-viewport-height, 100dvh) - 40px) !important;
+}
+@media (max-width:600px) {
+  .amux-dialog-viewport button { min-height:44px; min-width:44px; }
+}
+
+.chip-picker-header { display:flex; align-items:center; gap:8px; }
+.chip-picker-header input { min-width:0; flex:1; }
+.amux-dialog-viewport > :is(.chip-picker,.tts-dialog,.focus-card,.conn-picker,.mdai-picker) {
+  max-height: calc(var(--dialog-viewport-height, 100dvh) - 40px) !important;
+}
+@media (max-width:600px) {
+  .overlay-header button, .file-overlay-header button { min-height:44px; min-width:44px; }
+}
+
+@media (max-width:600px) {
+  #scope-edit-backdrop button { min-height:44px !important; }
+  .chip-picker { max-width:calc(100vw - 24px); }
+}
+#apikey-setup-modal > div {
+  max-height:calc(var(--dialog-viewport-height, 100dvh) - 40px); overflow-y:auto; overscroll-behavior:contain;
+}
+
+.amux-dialog-backdrop > div, .amux-workspace-dialog > div {
+  max-height:calc(var(--dialog-viewport-height, 100dvh) - 40px) !important;
+}
+.amux-dialog-viewport.overlay {
+  top:max(var(--dialog-viewport-top, 0px),env(safe-area-inset-top, 0px)) !important;
+  height:calc(var(--dialog-viewport-height, 100dvh) - env(safe-area-inset-top, 0px)) !important;
+}
+
+#upgrade-modal > div { max-height:calc(var(--dialog-viewport-height, 100dvh) - 40px) !important; }
+@media (max-width:600px) { #video-overlay button { min-width:44px; min-height:44px; } }
+
+.vp-heading { display:flex; align-items:center; gap:12px; margin-bottom:8px; color:#fff; }
+#vp-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.85rem; }
+.vp-heading button { flex-shrink:0; min-width:44px; min-height:44px; background:#20242a; border:1px solid #59616d; border-radius:8px; color:#fff; cursor:pointer; }
+@media (max-width:600px) {
+  #vp-controls > div:last-child { flex-wrap:wrap; gap:4px !important; }
+  #vp-volume { max-width:48px; }
+  #teleprompter-overlay button { min-width:44px; min-height:44px; }
+}
+.conn-picker-overlay { align-items:center; padding:20px 12px; }
+
+/* AF-750 / AF-751: balanced status controls at desktop and phone widths. */
+.header-row { gap:12px; }
+.header-row > .header-actions { margin-left:auto; }
+.header-row > #interaction-feedback { margin-left:0; }
+.header-row #brand-header { font-size:1.3rem; }
+/* AMUX-4475: toolbar icon buttons get a consistent bordered box (Ethan,
+   2026-09-12: "borders around buttons too" + "make the components all
+   consistent"). Every header control now reads as the same boxed button. */
+.header-row #notif-btn { width:44px; height:44px; min-width:44px; display:flex; align-items:center; justify-content:center; color:var(--dim); opacity:1 !important; border:1px solid var(--border); background:var(--card); border-radius:8px; }
+.header-row #notif-badge { top:0; right:0; border:2px solid var(--bg); height:18px; min-width:18px; border-radius:10px; font-size:9px; }
+.header-row .btn-active .active-dot { box-shadow:none; width:6px; height:6px; }
+.header-row .btn-rate-limit { color:var(--red); border:1px solid rgba(248,81,73,0.45); background:rgba(248,81,73,0.12); }
+.header-row .btn-active, .header-row .settings-btn { border:1px solid var(--border); background:var(--card); border-radius:8px; }
+.header-row #settings-btn { color:var(--dim); }
+.header-row svg { flex-shrink:0; }
+.header-row #notif-btn:hover, .header-row .btn-active:hover, .header-row .settings-btn:hover { background:var(--border); }
+.header-row .btn-rate-limit:hover { background:rgba(248,81,73,0.22); }
+@media (min-width:601px) { .header-row .header-actions { gap:10px !important; } .header-row .settings-btn,.header-row .btn-active,.header-row .btn-rate-limit,.header-row .header-add-btn { min-height:44px; } }
+@media (max-width:600px) {
+ .header-row { gap:0; }
+ .header-row > #interaction-feedback { margin-left:auto; }
+ .header-row #conn-status::before { width:9px; height:9px; }
+ .header-row #rate-limit-pill-count { font-size:0.85rem; }
+ .header-row .header-add-btn { border-radius:12px; font-size:1.35rem; }
+}
+
+.header-row #notif-badge { background:#cf222e; }
+.header-row :is(button,[role="button"]):focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:8px; }
+@media (max-width:600px) {
+  .tab-bar { min-width:0; padding-left:8px; }
+  .tab-bar button { padding:10px 12px; font-size:0.8rem; min-height:44px; }
+  .tab-customize-wrap { padding:0; }
+  .tab-customize-btn { min-width:44px; min-height:44px; }
+}
+
+/* AF-754: production component contract; Settings → Style guide uses these classes. */
+.btn:disabled { opacity:.55; cursor:not-allowed; }
+.btn[aria-busy="true"] { cursor:progress; }
+.btn:focus-visible, .input:focus-visible, .modal-close:focus-visible { outline:2px solid var(--accent); outline-offset:2px; box-shadow:var(--focus-ring); }
+.input[aria-invalid="true"] { border-color:var(--red); }
+select.input { height:var(--control-height); }
+.ui-field { display:flex; flex-direction:column; gap:var(--space-2); min-width:0; font-size:var(--control-font); }
+.ui-help { color:var(--dim); font-size:.8rem; line-height:1.5; }
+.ui-error { color:var(--red); font-size:.8rem; }
+.ui-guide.modal { max-width:960px; }
+.ui-guide .modal-header { gap:var(--space-3); }
+.ui-guide .modal-body { display:grid; gap:var(--space-6); }
+.ui-guide-section { display:grid; gap:var(--space-3); min-width:0; }
+.ui-guide-section h4 { font-size:1rem; }
+.ui-guide-row { display:flex; align-items:center; flex-wrap:wrap; gap:var(--space-2); }
+.ui-guide-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:var(--space-4); }
+.ui-guide-swatch { display:flex; align-items:center; gap:var(--space-2); padding:var(--space-3); border:1px solid var(--border); border-radius:var(--radius-control); }
+.ui-guide-swatch i { width:24px; height:24px; border:1px solid var(--border); border-radius:50%; flex-shrink:0; }
+.ui-guide code { color:var(--dim); font-size:.8rem; overflow-wrap:anywhere; }
+.ui-guide-rule { padding:var(--space-3); border:1px solid var(--border); border-radius:var(--radius-control); line-height:1.6; }
+.ui-guide .modal-footer { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:var(--space-2); }
+@media (max-width:600px) {
+  :root { --control-height:44px; --control-font:16px; }
+  .btn { min-width:44px; }
+  .input, .modal-body .input { font-size:16px; }
+}
+
+/* Record tab (AMUX-4625) */
+#tab-record.recording .tab-ico { color:var(--red); }
+.recorder-wrap { display:flex; flex-direction:column; gap:var(--space-4); padding:var(--space-4); padding-bottom:calc(var(--space-6) + env(safe-area-inset-bottom)); overflow-y:auto; flex:1; min-height:0; max-width:760px; width:100%; box-sizing:border-box; margin:0 auto; }
+.recorder-hero { display:flex; align-items:center; gap:var(--space-4); padding:var(--space-4); background:var(--card); border:1px solid var(--border); border-radius:var(--radius-dialog); }
+.recorder-btn { width:104px; height:104px; min-width:104px; border-radius:50%; border:3px solid var(--border); background:var(--bg); display:flex; align-items:center; justify-content:center; cursor:pointer; -webkit-tap-highlight-color:transparent; flex-shrink:0; }
+.recorder-btn:focus-visible { outline:2px solid var(--accent); box-shadow:var(--focus-ring); }
+.recorder-btn-dot { width:44px; height:44px; border-radius:50%; background:var(--red); transition:border-radius .15s ease, width .15s ease, height .15s ease; }
+.recorder-btn.recording { border-color:var(--red); }
+.recorder-btn.recording .recorder-btn-dot { width:36px; height:36px; border-radius:8px; }
+.recorder-readout { display:flex; flex-direction:column; gap:var(--space-2); min-width:0; flex:1; }
+.recorder-elapsed { font-size:2rem; font-weight:600; font-variant-numeric:tabular-nums; color:var(--text); line-height:1.1; }
+.recorder-level { height:8px; border-radius:4px; background:var(--bg); border:1px solid var(--border); overflow:hidden; }
+.recorder-level-fill { height:100%; width:100%; background:var(--green); transform:scaleX(0.02); transform-origin:left center; }
+.recorder-status { color:var(--dim); font-size:.85rem; line-height:1.4; overflow-wrap:anywhere; }
+.recorder-sync-row { display:flex; align-items:center; gap:var(--space-3); flex-wrap:wrap; justify-content:space-between; }
+.recorder-sync-summary { color:var(--dim); font-size:.85rem; min-width:0; }
+.recorder-list { display:flex; flex-direction:column; gap:var(--space-2); }
+.recorder-note { overflow-wrap:anywhere; }
+.recorder-empty { color:var(--dim); font-size:.9rem; padding:var(--space-4) 0; text-align:center; }
+.recorder-day { color:var(--dim); font-size:.75rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; margin-top:var(--space-2); }
+.recorder-item { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-control); padding:var(--space-3); display:flex; flex-direction:column; gap:var(--space-1); min-width:0; }
+.recorder-item-head { display:flex; align-items:baseline; gap:var(--space-2); flex-wrap:wrap; }
+.recorder-when { font-weight:600; color:var(--text); }
+.recorder-meta { color:var(--dim); font-size:.8rem; }
+.recorder-sync { font-size:.85rem; overflow-wrap:anywhere; color:var(--text); }
+.recorder-sync-failed { color:var(--red); }
+.recorder-sync-recording { color:var(--red); }
+.recorder-sync-local, .recorder-sync-syncing { color:var(--yellow); }
+.recorder-sync-synced { color:var(--green); }
+.recorder-sync-empty { color:var(--dim); }
+.recorder-transcript-state { font-size:.8rem; color:var(--dim); }
+.recorder-excerpt { font-size:.85rem; color:var(--text); line-height:1.45; overflow-wrap:anywhere; }
+.recorder-actions { display:flex; gap:var(--space-2); flex-wrap:wrap; margin-top:var(--space-1); }
+.recorder-settings { background:var(--card); border:1px solid var(--border); border-radius:var(--radius-control); padding:var(--space-3); }
+.recorder-settings summary { cursor:pointer; font-weight:600; min-height:44px; display:flex; align-items:center; }
+.recorder-settings[open] summary { margin-bottom:var(--space-2); }
+.recorder-dir-row { display:flex; gap:var(--space-2); align-items:center; }
+.recorder-dir-row .input { flex:1; min-width:0; }
+.recorder-check { display:flex; align-items:center; gap:var(--space-2); min-height:44px; margin:var(--space-2) 0; font-size:var(--control-font); }
+.recorder-check input { width:22px; height:22px; }
+.recorder-transcript { white-space:pre-wrap; overflow-wrap:anywhere; max-height:55vh; overflow-y:auto; margin-top:var(--space-2); line-height:1.5; }
+@media (max-width: 600px) {
+  .recorder-wrap { padding:var(--space-3); padding-bottom:calc(var(--space-6) + env(safe-area-inset-bottom)); }
+  .recorder-hero { flex-direction:column; text-align:center; }
+  .recorder-readout { width:100%; align-items:stretch; }
+  .recorder-actions .btn { flex:1 1 auto; min-height:44px; }
+  .recorder-sync-row .btn { min-height:44px; }
+  .recorder-dir-row { flex-direction:column; align-items:stretch; }
+  .recorder-dir-row .btn { min-height:44px; }
 }

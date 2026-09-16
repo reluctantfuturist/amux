@@ -21,6 +21,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Browser evidence and lifecycle cleanup controls (AF-768, AF-773)
+        run: |
+          npm ci --ignore-scripts
+          node --test tests/ci-e2e-evidence.test.mjs tests/worker-lifecycle-cleanup.test.mjs
       # AF-148 / AMUX-3524 follow-up: a client JS change that ships WITHOUT a
       # version bump reaches no browser holding the cached script, and nothing
       # said so. dashboard_assets.rs pins that APP_VER and CACHE AGREE — but
@@ -165,6 +169,8 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustration-scan.sh
+      - name: direct delivery verdicts survive scanner SQL and output (AF-889)
+        run: python3 scripts/test-frustration-delivery.py
       # The THEME scanner's cells (AF-341). Wired in the same commit that adds the
       # scanner, because the step above records what happens otherwise: that
       # harness existed unwired and its 6 cells ran for nobody.
@@ -181,6 +187,10 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-friction-themes.sh
+      - name: attachment metadata cannot manufacture cross-repo instructions (AF-888)
+        run: python3 scripts/test-friction-attachments.py
+      - name: peer collaboration cannot inflate board-drive nudge pressure (AF-890)
+        run: python3 scripts/test-friction-nudges.py
       # AF-360. The dashboard stamps every outgoing message with the send time
       # and had no guard against text that already carried one, so re-sending
       # produced a nested stamp. Measured live on MSG-35221. The reader strips a
@@ -212,10 +222,22 @@ jobs:
       # for AF-346, whose whole incident was a correct guard that did not run.
       # A ratchet against a recorded baseline, so the 32 stay their owners'
       # decision and number 33 cannot arrive quietly.
+      - name: Corrupt board acknowledgements retain unknown outcomes
+        run: python3 scripts/test-board-ack-unknown.py
+      - name: Cargo worktrees reuse builds without stale commit identity
+        run: python3 scripts/test-cargo-worktree-provenance.py
       - name: no harness is written and then never invoked (AF-346)
         run: |
           set -uo pipefail
           ./scripts/test-harness-wired.sh
+      # AF-791. The shared-target staleness notice in test-contended.sh. The
+      # fixture is a dependency-free crate in a private temp target built with
+      # --offline, so this costs two tiny compiles and no network. It only
+      # samples the build lock, so a runner with no ~/.amux does not wait on it.
+      - name: a content edit with a preserved mtime refreshes the shared target (AF-791)
+        run: |
+          set -euo pipefail
+          bash scripts/test-cargo-target-fingerprint.sh
       # AF-346 second pass + AF-336. `--test <name>` skips the LIB ENTIRELY and
       # prints the smallest number of any selector, so it is the likeliest to be
       # read as a clean suite; and the worktree clause listed every dirty file
@@ -225,6 +247,21 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-selector-clauses.sh
+      # The debris reaper deletes directories without asking, so what keeps it
+      # safe is worth pinning: it takes only amux's own prefixes, only past the
+      # age floor, never a live session's scratchpad, and nothing at all without
+      # --apply. Runs against a mktemp fixture (AMUX_DEBRIS_ROOTS) and a throwaway
+      # git repo, so it touches no real temp root and needs no server or cargo.
+      # Two of its cells were vacuous when first written and were rewritten until
+      # mutating the guard they name reddens them.
+      - name: the debris reaper reaps only amux's own, and only when told (AMUX-4357)
+        run: |
+          set -uo pipefail
+          ./scripts/test-reap-amux-debris.sh
+      - name: the machine-cleanup tick acts only where it is allowed to (AMUX-4686)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mac-cleanup-tick.sh
       # AF-677. AF-346's ratchet (above) recorded 31 harnesses as unwired rather
       # than wiring them blind, because that decision belongs to each one's
       # owner (ethos rule 8). This is that decision, made for 28 of the 31:
@@ -286,6 +323,8 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/test-install-hook-source-ref.sh
+      - name: installer Rust builds exclude uncommitted shared-checkout sources
+        run: python3 scripts/test-install-committed-source.py
       - name: install advice does not linger after the install actually lands
         run: |
           set -uo pipefail
@@ -449,6 +488,42 @@ jobs:
           ./scripts/test-discard-folded-into-help.sh
           ./scripts/test-send-fallback-atomic.sh
           ./scripts/test-depends-on-help.sh
+      # AMUX-4570: board doing names the right remedy for each refusal. Its own
+      # step so a failure is named by step in the job view. (An earlier comment
+      # here said the step above reports only its last script. It does not: run
+      # blocks execute under bash -e, so that step fails on its first failing
+      # script. Corrected under AMUX-4651.)
+      - name: CLI refusal remedies (board doing)
+        run: ./scripts/test-board-continuation-hint.sh
+      # AMUX-4652: board needs reports a refused blocker link instead of claiming it.
+      # Its own step for the same reason as the one above.
+      - name: CLI board needs checks its link write
+        run: ./scripts/test-board-needs-link-refusal.sh
+      # AMUX-4654: board needsyou writes the ask, then the status, then the
+      # needs:you tag, because the server refuses that tag before the status.
+      - name: CLI board needsyou moves before it tags
+        run: ./scripts/test-board-needsyou-order.sh
+      # AMUX-4653: board request posts request_to, so the card lands on the
+      # TARGET's board. Its own step because the server half passes on its own
+      # while a CLI still sending `reviewer` leaves the feature dead.
+      - name: CLI board request routes to the target
+        run: ./scripts/test-board-request-routes-to-target.sh
+      # AMUX-4705: a piped brief splits into a one-line title and a body. Its
+      # own step because the failure is silent: the card is created, exit 0, and
+      # the title is a paragraph.
+      - name: CLI piped brief splits into title and body
+        run: ./scripts/test-board-piped-title-body.sh
+      # AMUX-4685: cdp.mjs tells amux it is driving, over a SELF-SIGNED cert.
+      # Its own step because the failure mode is a silent no-op: Node's fetch
+      # rejects amux's certificate, the best-effort catch swallows it, and the
+      # feature looks exactly like a working one.
+      - name: CDP keepalive reaches a self-signed amux
+        run: ./scripts/test-cdp-keepalive.sh
+      # AMUX-4689: a refused test run must certify nothing. The refusal half
+      # compiles nothing; the control reuses the workspace target dir and the
+      # smallest crate, so this stays a seconds-scale step in the no-compile job.
+      - name: A refused test run certifies nothing
+        run: ./scripts/test-contended-refusal.sh
       # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
       # lanes invoke it while it is being edited, so it MUST be parseable in one
       # read: bash holds a byte offset, and a rewrite mid-invocation resumes it
@@ -499,6 +574,7 @@ jobs:
           ./scripts/test-build-provenance.sh
           ./scripts/test-build-disk-clear.sh
           python3 scripts/test-cargo-target-guard.py
+          python3 scripts/test-cargo-budget.py
           ./scripts/test-build-activation-authority.sh
           ./scripts/test-build-activation-launcher.sh
           # A replacement is complete and signed before its one visible rename;

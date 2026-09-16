@@ -342,11 +342,13 @@ pub const NEEDSYOU_ASK_REQUIRED_KEY: &str = "AMUX_NEEDSYOU_ASK_REQUIRED";
 /// means a call only the owner's taste can settle, which is a real category
 /// (ethos rule 3 wants a truthful path for it) and NOT "I would like a second
 /// opinion".
-pub const ASK_TYPES: [&str; 5] = ["decision", "access", "credential", "external", "judgment"];
+pub const ASK_TYPES: [&str; 7] = ["budget", "customer_outbound", "decision", "access", "credential", "external", "judgment"];
 
 /// What each type means, printed in the refusal so the reader picks correctly
 /// on the first try rather than by guessing at five bare words.
-pub const ASK_TYPE_HELP: [(&str, &str); 5] = [
+pub const ASK_TYPE_HELP: [(&str, &str); 7] = [
+    ("budget", "increase spend or exceed an authorized budget"),
+    ("customer_outbound", "send customer communication without existing authorization"),
     ("decision", "a choice only the owner can make — direction, priority, or a trade-off with no right answer"),
     ("access", "you cannot reach something: a repo, a console, an environment, a person"),
     ("credential", "a secret, token, key or sign-in only the owner can supply"),
@@ -379,6 +381,21 @@ pub fn needsyou_ask_required(session: Option<&str>) -> bool {
         Some(v) => !is_off(&v),
         None => true,
     }
+}
+
+/// Scoped authorization categories, independent of whether the question is well
+/// formed. `*` is the explicit legacy policy. Existing deployments keep it until
+/// the owner selects a global/group/worker policy; no worker can silently infer
+/// a budget grant from the absence of a typed question.
+pub fn approval_types(session: Option<&str>) -> Vec<String> {
+    let configured = std::env::var("AMUX_APPROVAL_TYPES").ok().filter(|v|!v.trim().is_empty())
+        .or_else(||session.and_then(|s|crate::api::session_verbs::scoped_setting_in(&crate::api::session_verbs::home(),s,"AMUX_APPROVAL_TYPES")))
+        .unwrap_or_else(||"*".into());
+    configured.split(',').map(|s|s.trim().to_ascii_lowercase()).filter(|s|!s.is_empty()).collect()
+}
+pub fn approval_type_allowed(session: Option<&str>, kind: &str) -> bool {
+    let allowed=approval_types(session);
+    allowed.iter().any(|s|s=="*" || s==&kind.trim().to_ascii_lowercase())
 }
 
 /// Why a typed ask was refused, or that it was accepted.
@@ -1008,10 +1025,18 @@ pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String>
             "Ready for another set of eyes",
         ],
         (ItemType::Code, TaskStatus::Done) => &["Implemented and merged", "Tests / lint pass"],
+        // AF-719: criteria 2/3 used to have no truthful path for a code card in
+        // a repo/domain with no deployment concept at all (a local analysis
+        // script, a one-shot data-repo fix) — unlike criterion 1, which already
+        // had the "if not applicable, note why" escape. amux-server's own code
+        // genuinely deploys to a running service, so the bar is unchanged for
+        // it; the escape only matters for a code card where it is honestly
+        // inapplicable, and noting why is not a weaker bar than asserting a
+        // deployment that never happened.
         (ItemType::Code, TaskStatus::Verified) => &[
             "CI/CD green (if e2e infra is unavailable, note why — that is not a failure)",
-            "Deployed to prod",
-            "Confirmed working in prod",
+            "Deployed to prod (if this card has no deployment target, note why)",
+            "Confirmed working in prod (if this card has no deployment target, note why)",
             "Zero regressions",
         ],
         // Decision (AF-323): a card whose only output is an answer from the
@@ -1758,6 +1783,15 @@ pub struct IssueRow {
     pub callback_fired_at: Option<i64>,
     /// Visible refusal/recovery detail; never hidden in logs alone.
     pub callback_error: Option<String>,
+    /// Hard lease (RR-0052, migration 0068). `lease_owner` is the lane NAME
+    /// holding this card; NULL means no lease (every legacy card), which behaves
+    /// exactly as before. The timestamps are unix seconds; `lease_generation` is
+    /// bumped on every reclaim so a write from a dead claimant is recognizable.
+    pub lease_owner: Option<String>,
+    pub lease_acquired_at: Option<i64>,
+    pub lease_heartbeat_at: Option<i64>,
+    pub lease_expires_at: Option<i64>,
+    pub lease_generation: i64,
     /// Set ONLY when `desc` holds a bounded PREFIX rather than the whole
     /// string, which the slim list does to stop hydrating ~30 MB of prose per
     /// call (AF-346). `None` means `desc` is complete and every consumer
@@ -1867,8 +1901,7 @@ impl IssueRow {
             "next_action": self.next_action,
             "last_result": self.last_result,
             "unresolved": self.unresolved,
-            "acceptance_criteria": self.acceptance_criteria.as_deref()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            "acceptance_criteria": parse_json_or_raw_string(self.acceptance_criteria.as_deref()),
             "decision_question": self.decision_question,
             "decision_rationale": self.decision_rationale,
             "decision_supersedes": self.decision_supersedes,
@@ -1929,9 +1962,10 @@ impl IssueRow {
     /// not in the shared vocabulary (a custom Python lane) — callers must
     /// refuse the transition honestly rather than guess.
     ///
-    /// `worker` is always `None`: `issues.session` is an owner NAME, not a
-    /// claim by `WorkerId` — atomic claims/leases land with RR-0052.
-    /// NO CARD MAY VANISH (AMUX-2632).
+    /// `worker` is the LEASE holder (`lease_owner`), not `session`: an owner
+    /// NAME mapped to a `WorkerId` via `foreign_worker_id` so core's
+    /// `AlreadyClaimed` becomes name-equality (RR-0052). A card with no lease is
+    /// `None` and ungated, exactly as before. NO CARD MAY VANISH (AMUX-2632).
     ///
     /// This opened `parse_status(&self.status)?`, so a status outside the
     /// closed vocabulary returned None — and the orchestrator's one caller did
@@ -1967,7 +2001,15 @@ impl IssueRow {
             title: self.title.clone(),
             desc: self.desc.clone(),
             status,
-            worker: None,
+            // RR-0052: the holder is the lease owner (lane NAME), mapped to a
+            // WorkerId via `foreign_worker_id` so core's `AlreadyClaimed` becomes
+            // name-equality. NULL lease -> None -> ungated, exactly as before.
+            worker: self
+                .lease_owner
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(crate::orchestrator::runtime::foreign_worker_id),
             item_type: core_item_type(&self.item_type),
             creator,
             created_at: ts(self.created),
@@ -2001,7 +2043,9 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
      i.decision_supersedes, i.waiting_on, i.requested_by, i.callback_session, \
      i.callback_prompt, i.callback_state, i.callback_message_id, \
-     i.callback_fired_at, i.callback_error, i.ask_actor";
+     i.callback_fired_at, i.callback_error, i.ask_actor, \
+     i.lease_owner, i.lease_acquired_at, i.lease_heartbeat_at, \
+     i.lease_expires_at, COALESCE(i.lease_generation,0)";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -2128,6 +2172,11 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         callback_fired_at: r.get(49)?,
         callback_error: r.get(50)?,
         ask_actor: r.get(51)?,
+        lease_owner: r.get(52)?,
+        lease_acquired_at: r.get(53)?,
+        lease_heartbeat_at: r.get(54)?,
+        lease_expires_at: r.get(55)?,
+        lease_generation: r.get(56)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2744,11 +2793,13 @@ pub struct NewIssue {
 /// the noise this is here to prevent.
 ///
 /// KNOWN IMPRECISION, stated rather than hidden: `desc` is the prompt TRUNCATED to
-/// 300 chars, so two genuinely different prompts sharing a 300-char prefix compare
-/// equal here and the second is suppressed. The cmd_history guard above does not
-/// have this edge, because it compares the full text. Accepted because the two
-/// cards would be indistinguishable on the board anyway (both descs are the same
-/// 300 chars), and because the caller logs the SURVIVING card id on every
+/// `CAPTURE_DESC_CHAR_CAP` chars (2000, AF-716 — raised from the original 300,
+/// which cut real reports off mid-sentence with no marker), so two genuinely
+/// different prompts sharing that long a prefix compare equal here and the
+/// second is suppressed. The cmd_history guard above does not have this edge,
+/// because it compares the full text. Accepted because the two cards would be
+/// indistinguishable on the board anyway (both descs are the same truncated
+/// text), and because the caller logs the SURVIVING card id on every
 /// suppression, so a wrongly dropped prompt is a greppable line rather than a
 /// missing card nobody can see. If that line ever shows up for prompts that are not
 /// duplicates, the fix is to store a full-prompt hash on the card, not a longer
@@ -2879,8 +2930,94 @@ pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
 /// "closed" means.
 pub const TERMINAL_STATUSES: [&str; 3] = ["done", "verified", "discarded"];
 
+/// Reads a column that is supposed to hold a JSON-encoded value (currently
+/// `acceptance_criteria`) without silently turning real content into `null`
+/// when it isn't valid JSON (AF-711).
+///
+/// The prior form of every caller was `.and_then(|s| serde_json::from_str(s)
+/// .ok())`, which reports EXACTLY the same `null` for "column is empty" and
+/// "column holds real text that failed to parse" — the second case is a
+/// caller having stored a plain string (a genuinely reasonable value for a
+/// text field to hold) with no way to know their content is now invisible
+/// everywhere the row is read. A parse failure returns the raw string
+/// instead: still visible, even if not structured the way a `board decompose`-
+/// written array would be.
+pub fn parse_json_or_raw_string(s: Option<&str>) -> serde_json::Value {
+    match s {
+        None => serde_json::Value::Null,
+        Some("") => serde_json::Value::Null,
+        Some(s) => {
+            serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.to_string()))
+        }
+    }
+}
+
 pub fn is_terminal_status(s: &str) -> bool {
     TERMINAL_STATUSES.contains(&s)
+}
+
+/// Seconds a fresh lease is granted for before it expires (RR-0052). Short
+/// enough to free a crashed worker's slot fast, long enough to survive a slow
+/// turn. The holder's activity advances the heartbeat, pushing the expiry out.
+/// `AMUX_LEASE_TTL_S` overrides (default 1800 = 30 min).
+pub fn lease_ttl_s() -> i64 {
+    std::env::var("AMUX_LEASE_TTL_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(1800)
+}
+
+/// Whether the PATCH door REFUSES a transition from a non-holder (RR-0052).
+/// Default OFF during rollout: leases are still written and the reaper still
+/// runs, but a cross-lane transition is only LOGGED ("would refuse"), not
+/// refused, so the would-refuse rate can be watched before enforcement flips on.
+/// `AMUX_LEASE_ENFORCE=1` turns hard refusal on.
+pub fn lease_enforcement_enabled() -> bool {
+    matches!(
+        std::env::var("AMUX_LEASE_ENFORCE").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Minimum seconds between two heartbeat writes for the same held card.
+///
+/// Every UPDATE on `issues` fires `search_issues_au`, which rewrites the card's
+/// whole search document (desc + log). The report hook fires on EVERY tool
+/// call, so an unthrottled heartbeat would reindex a busy lane's card several
+/// times a second. 60s against a 1800s TTL loses nothing a reaper can see.
+pub const LEASE_HEARTBEAT_MIN_GAP_S: i64 = 60;
+
+/// Heartbeat writes that actually moved a lease forward, process-lifetime.
+/// Published by `/api/debug/board-drive` beside the reaper's counts: leases
+/// being granted while this stays at 0 means the heartbeat path is broken and
+/// every busy holder is about to be reaped (the RR-0052 slice-2 bug, where the
+/// reaper's liveness events were never written by anything).
+pub static LEASE_HEARTBEATS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RR-0052 heartbeat: the holder lane is alive, so push out the expiry of every
+/// `doing` card it holds. Called from the worker self-report path, which is the
+/// one signal that comes FROM the worker process (a delivered message comes from
+/// the server, and proves nothing about the receiver).
+///
+/// Deliberately a raw UPDATE of the lease columns only: `updated` and `version`
+/// are untouched, so a heartbeat never reads as a card edit, never bumps rot
+/// clocks, and never races a real PATCH on the version check.
+pub fn refresh_lease_heartbeat(conn: &Connection, holder: &str, now: i64) -> rusqlite::Result<usize> {
+    let holder = holder.trim();
+    if holder.is_empty() {
+        return Ok(0);
+    }
+    let n = conn.execute(
+        "UPDATE issues SET lease_heartbeat_at = ?2, lease_expires_at = ?2 + ?3 \
+         WHERE status = 'doing' AND lease_expires_at IS NOT NULL AND lease_owner = ?1 \
+           AND deleted IS NULL AND COALESCE(lease_heartbeat_at, 0) <= ?2 - ?4",
+        params![holder, now, lease_ttl_s(), LEASE_HEARTBEAT_MIN_GAP_S],
+    )?;
+    if n > 0 {
+        LEASE_HEARTBEATS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(n)
 }
 
 /// A completed dependency must satisfy its type's real completion boundary.
@@ -2971,7 +3108,8 @@ pub fn folded_into(log: Option<&str>) -> Option<String> {
 /// The predicate is `creator='amux'` plus the `**Prompt:**` desc marker, which
 /// is the same pair the fold query, the dispatch filters and board-drive already
 /// use inline in four places. Named here because AF-634 needs it in prose rather
-/// than in SQL.
+/// than in SQL. [`capture_is_delegated_ask`] then carves out the one captured
+/// shape that IS a unit of work, and says why.
 ///
 /// AF-634 (ts-gke, 19 cards and at least 21 notifications in one night): when a
 /// recipient correctly discards one of these, the terminal callback fires AT THE
@@ -2986,7 +3124,115 @@ pub fn folded_into(log: Option<&str>) -> Option<String> {
 /// sender at all is ts-gke's option 1 or 2 and is not one lane's call; this is
 /// their option 3, which changes only what the sentence says.
 pub fn is_capture_shell(row: &IssueRow) -> bool {
-    row.creator == "amux" && row.desc.trim_start().starts_with("**Prompt:**")
+    row.creator == "amux"
+        && row.desc.trim_start().starts_with("**Prompt:**")
+        && !capture_is_delegated_ask(&row.desc)
+}
+
+/// A captured message whose FIRST LINE opens with `ASK` and names a board id is
+/// a delegation, so it is a request rather than a shell (AMUX-4677).
+///
+/// Reported by mixpeek-finances with a receipt. MG-1786's prompt begins
+/// `ASK (Ethan, resumed you for this): pick up MF-1165`, mixpeek-general picked
+/// MF-1165 up and discarded the duplicate envelope, and the terminal callback
+/// told the sender "Nothing was requested of this lane and nothing is owed".
+/// [`terminal_summary`] asserts that sentence for every discarded shell and has
+/// no input capable of contradicting it. The sender read it as their hand-off being
+/// dropped. It also matters before the discard: a shell occupies no WIP slot and
+/// `drainable_backlog_rows` never dispatches one, so a delegation that lands in
+/// backlog as a shell sits there.
+///
+/// `amux board request <lane> <title>` parks the card on the SENDER's board
+/// (AMUX-4653), so a message is the fallback path for handing work over, and
+/// this is the most explicit form that message can take.
+///
+/// Deliberately narrow, because the risk is turning every message containing the
+/// word "ask" into a request: uppercase `ASK` at the start of the FIRST LINE of
+/// the prompt, plus a board id LATER on that same line. "let me know if you want
+/// me to ask about MS-1496" fails on both counts.
+///
+/// The board id test is two adjacent uppercase letters, a hyphen and a digit,
+/// which is looser than [`contains_card_ref`]'s tokenizer and deliberately so:
+/// this rule has a SQL mirror in [`capture_shell_sql`] and every clause here has
+/// to be one GLOB can express exactly. It does not check that the id names a row
+/// that exists: both this and the mirror answer from the row alone, and an
+/// `EXISTS` subquery per row over a 12k-row board is not a predicate you
+/// interpolate into a dispatch query. A well-formed id that names nothing keeps
+/// one extra card, which is the recoverable direction.
+pub fn capture_is_delegated_ask(desc: &str) -> bool {
+    let Some(first) = capture_prompt_first_line(desc) else { return false };
+    let Some(rest) = first.strip_prefix("ASK") else { return false };
+    rest.as_bytes().windows(4).any(|w| {
+        w[0].is_ascii_uppercase()
+            && w[1].is_ascii_uppercase()
+            && w[2] == b'-'
+            && w[3].is_ascii_digit()
+    })
+}
+
+/// The first line of a captured prompt, or `None` when `desc` is not a capture
+/// envelope.
+///
+/// Mirrors [`capture_shell_sql`]'s extraction step for step. After the
+/// `**Prompt:**` marker it strips SPACES ONLY: SQLite's `ltrim(x, ' ')` cannot
+/// strip a newline, and a `trim_start()` here would walk a prompt that begins
+/// with a blank line onto line two while the SQL stayed on line one.
+fn capture_prompt_first_line(desc: &str) -> Option<&str> {
+    let rest = desc.trim_start().strip_prefix("**Prompt:**")?.trim_start_matches(' ');
+    Some(rest.split('\n').next().unwrap_or(rest))
+}
+
+/// [`is_capture_shell`] as a SQL predicate, for the queries that select or
+/// count board rows without loading them (AMUX-4697).
+///
+/// ONE definition, interpolated, rather than the same clauses written into each
+/// query. Five call sites spelling a predicate by hand is how two of them come
+/// to disagree, and the disagreement is invisible until a count and a dispatch
+/// list differ by rows nobody can name.
+///
+/// Expects the `issues` row to be addressable as `i`. `ltrim` mirrors
+/// `trim_start`: SQLite's default `ltrim` strips spaces only, so the leading
+/// newline that `save_patched` can leave is handled explicitly. The test
+/// `the_sql_predicate_and_the_rust_one_select_the_same_rows` runs both over the
+/// same fixtures and fails if they ever part company.
+///
+/// Built rather than written as a const so the first-line extraction appears
+/// once here and reads the same as the Rust one. `GLOB` and not `LIKE` for the
+/// ask clause: LIKE is case-insensitive over ASCII in SQLite, so `LIKE 'ASK%'`
+/// would match "ask me later" and part company with `strip_prefix("ASK")` on the
+/// very first message anyone writes in lower case.
+pub fn capture_shell_sql() -> String {
+    format!("({} AND NOT {})", capture_envelope_sql(), capture_delegation_sql())
+}
+
+/// `creator='amux'` plus the `**Prompt:**` marker: amux minted this row from an
+/// inbound prompt, whatever the prompt turned out to say.
+pub fn capture_envelope_sql() -> String {
+    format!("(i.creator = 'amux' AND {} LIKE '**Prompt:**%')", capture_desc_trimmed())
+}
+
+/// [`capture_is_delegated_ask`] as SQL. Split out from [`capture_shell_sql`] so
+/// the diagnostic that COUNTS delegations and the predicate that EXEMPTS them
+/// read the same clause (AMUX-4677).
+fn capture_delegation_sql() -> String {
+    let prompt = format!("ltrim(substr({}, 12), ' ')", capture_desc_trimmed());
+    // Appending a newline makes `instr` always find one, which is the same
+    // answer as `split('\n').next()` and needs no CASE.
+    let first_line = format!("substr({prompt}, 1, instr({prompt} || char(10), char(10)) - 1)");
+    format!("({first_line} GLOB 'ASK*[A-Z][A-Z]-[0-9]*')")
+}
+
+/// An envelope that carries a delegation, for callers that want the population
+/// the carve-out rescued rather than the one it left behind.
+pub fn capture_delegation_row_sql() -> String {
+    format!("({} AND {})", capture_envelope_sql(), capture_delegation_sql())
+}
+
+/// `i.desc` with the leading whitespace `trim_start` removes. SQLite's default
+/// `ltrim` strips spaces only, so the newline `save_patched` can leave is named.
+/// '**Prompt:**' is 11 characters, so the prompt itself starts at offset 12.
+fn capture_desc_trimmed() -> String {
+    "ltrim(ltrim(i.desc, char(10) || char(13) || char(9)), ' ')".to_string()
 }
 
 /// The marker the SERVER appends when it chose the fold target itself.
@@ -3371,7 +3617,8 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              decision_supersedes = ?37, waiting_on = ?38, requested_by = ?39, \
              callback_session = ?40, callback_prompt = ?41, callback_state = ?42, \
              callback_message_id = ?43, callback_fired_at = ?44, callback_error = ?45, \
-             ask_actor = ?46 \
+             ask_actor = ?46, lease_owner = ?47, lease_acquired_at = ?48, \
+             lease_heartbeat_at = ?49, lease_expires_at = ?50, lease_generation = ?51 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -3420,6 +3667,11 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.callback_fired_at,
             row.callback_error,
             row.ask_actor,
+            row.lease_owner.as_deref().filter(|s| !s.is_empty()),
+            row.lease_acquired_at,
+            row.lease_heartbeat_at,
+            row.lease_expires_at,
+            row.lease_generation,
         ],
     )?;
     if needs_terminal_summary && changed == 1 {
@@ -5031,6 +5283,7 @@ mod tests {
         // newest verified, and the 100 newest done — the lumped 100-cap
         // showed 9 of a 141-card bulk-verify while Python showed all of it.
         let mk = |i: i64, status: &str| IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: format!("T-{i}"),
             title: String::new(),
@@ -5189,6 +5442,7 @@ mod configured_gate_tests {
 
     fn row(item_type: &str, gate: Option<&str>) -> IssueRow {
         IssueRow {
+            lease_owner: None, lease_acquired_at: None, lease_heartbeat_at: None, lease_expires_at: None, lease_generation: 0,
             desc_prefixed: None,
             id: "T-1".into(), title: String::new(), desc: String::new(),
             status: "doing".into(), session: None, creator: String::new(),
@@ -5582,6 +5836,160 @@ column=silent type:code=outranked(2)"
         assert!(is_capture_shell(&cap("amux", "\n  **Prompt:** hi", "discarded")));
     }
 
+    /// AMUX-4677: a captured message whose FIRST LINE is an `ASK` naming a card
+    /// is a delegation, so it stops being a shell and its sender stops being
+    /// told nothing was asked of the lane.
+    ///
+    /// Reported by mixpeek-finances with MG-1786, whose prompt opens
+    /// `ASK (Ethan, resumed you for this): pick up MF-1165`. mixpeek-general
+    /// picked MF-1165 up and discarded the duplicate envelope, and the terminal
+    /// callback still told the sender "Nothing was requested of this lane and
+    /// nothing is owed". AF-634 added that sentence for tidied chatter, and the
+    /// sender of a hand-off reads it as their request being dropped.
+    /// `amux board request` parks its card on the SENDER's board (AMUX-4653),
+    /// so a message is the path a lane actually has for handing work over.
+    ///
+    /// Both directions, because the risk here IS the fix: a lower-case "ask",
+    /// the word in a body, an id on the second line and an ask naming no card
+    /// all stay shells.
+    #[test]
+    fn a_first_line_ask_naming_a_card_is_a_request_not_a_shell() {
+        // The receipt, through its first newline.
+        const RECEIPT: &str = "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 on \
+the finances board, WS5 of epic MF-1168.\nThe bar Ethan set 2026-09-15: ONE COMMAND deploys \
+everything to a clean machine.";
+        assert!(capture_is_delegated_ask(RECEIPT), "the shape this card exists for");
+
+        for (desc, why) in [
+            ("**Prompt:** ask (ethan): pick up MF-1165", "lower-case ask is prose, not a marker"),
+            (
+                "**Prompt:** landed 3f79021a; say the word if you want me to ask about MF-1165",
+                "the word ask inside a body is the over-firing this must not do",
+            ),
+            (
+                "**Prompt:** ASK below\nthe card is MF-1165",
+                "the id has to be on the same line as the ask",
+            ),
+            ("**Prompt:** ASK: can you look at the retry loop", "an ask naming no card"),
+            ("**Prompt:** ASK (finances): pick up the docker bundle", "a subject but no id"),
+            ("ASK (finances): pick up MF-1165", "not a capture envelope at all"),
+        ] {
+            assert!(!capture_is_delegated_ask(desc), "{why}: {desc}");
+        }
+
+        // And the rendered sentence, which is what the sender actually read.
+        let mut conn = Connection::open_in_memory().expect("memdb");
+        crate::db::migrate::apply_all(&mut conn).expect("schema");
+        let add = |id: &str, desc: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, title, status, type, created, updated, creator, \"desc\")
+                 VALUES (?1, ?2, 'discarded', 'code', ?3, ?3, 'amux', ?4)",
+                rusqlite::params![id, format!("t {id}"), 1_760_000_000.0_f64, desc],
+            )
+            .expect("insert");
+            get_issue(&conn, id).expect("read").expect("row")
+        };
+
+        let ask = add("C-ASK", RECEIPT);
+        assert!(!is_capture_shell(&ask), "a delegation is a unit of work");
+        let (text, _) = terminal_summary(&conn, &ask, "doing").expect("summary");
+        assert!(
+            !text.contains("nothing is owed"),
+            "the sentence mixpeek-finances read as their hand-off being dropped: {text}"
+        );
+        assert!(!text.contains("captured message"), "{text}");
+
+        // THE DISCRIMINATION. Tidied chatter keeps AF-634's sentence, and if it
+        // did not this cell would pass on a predicate that had simply stopped
+        // recognising captures at all.
+        let chatter = add("C-CHAT", "**Prompt:** landed 3f79021a, ask me if you want MF-1165 next");
+        assert!(is_capture_shell(&chatter), "chatter is still a shell");
+        let (chat_text, _) = terminal_summary(&conn, &chatter, "doing").expect("summary");
+        assert!(chat_text.contains("nothing is owed"), "{chat_text}");
+    }
+
+    /// AMUX-4697: `capture_shell_sql` and `is_capture_shell` must select the
+    /// same rows, or a count and a dispatch list differ by rows nobody can name.
+    ///
+    /// Runs BOTH over the same fixtures rather than asserting each separately,
+    /// which is the only arrangement that can catch a drift: two independent
+    /// assertions both stay green while the predicates diverge.
+    #[test]
+    fn the_sql_predicate_and_the_rust_one_select_the_same_rows() {
+        // The REAL schema via the migration chain, not a hand-rolled four-column
+        // stand-in. `tests/schema_fixtures.rs` caught the stand-in and it was
+        // right to: this cell claims the SQL predicate selects the same rows as
+        // the Rust one, and a fixture whose `issues` differs from production
+        // cannot support that claim about production.
+        let conn = crate::db::migrate::test_memdb();
+        // Each case is (id, creator, desc) with the answer the Rust predicate
+        // gives, including the whitespace shapes a formatter can emit.
+        let cases = [
+            ("C-1", "amux", "**Prompt:** hello"),
+            ("C-2", "some-lane", "**Prompt:** hello"),
+            ("C-3", "amux", "Fix the parser"),
+            ("C-4", "amux", "\n  **Prompt:** hi"),
+            ("C-5", "amux", "   **Prompt:** spaces first"),
+            ("C-6", "amux", "\t**Prompt:** tab first"),
+            ("C-7", "amux", "\r\n**Prompt:** crlf first"),
+            ("C-8", "amux", "text then **Prompt:** later"),
+            ("C-9", "amux", ""),
+            // AMUX-4677's carve-out, on both sides of every clause it added.
+            // Ids sort after C-9 on purpose: the comparison below is ordered,
+            // and SQLite's BINARY collation puts "C-10" between "C-1" and "C-2".
+            ("C-A1", "amux", "**Prompt:** ASK (Ethan, resumed you for this): pick up MF-1165 now\nmore"),
+            ("C-A2", "amux", "**Prompt:** ask me about MF-1165"),
+            ("C-A3", "amux", "**Prompt:** ASK below\nthe card is MF-1165"),
+            ("C-A4", "amux", "**Prompt:** ASK: look at the retry loop"),
+            ("C-A5", "amux", "**Prompt:**ASK (x): pick up MF-1165"),
+            ("C-A6", "amux", "\n  **Prompt:**   ASK (x): pick up MF-1165"),
+        ];
+        // Every NOT NULL column the real schema carries. The hand-rolled
+        // four-column stand-in this replaced did not have them, which is the
+        // second thing the fixture guard was protecting: a narrow fixture
+        // accepts inserts production would reject.
+        for (id, creator, desc) in cases {
+            conn.execute(
+                "INSERT INTO issues (id,title,desc,status,creator,created,updated,owner_type, \
+                                     pinned,pos,notified,type,archived,rev,version,lease_generation) \
+                 VALUES (?1,?1,?2,'backlog',?3,1,1,'agent',0,0,0,'code',0,1,1,0)",
+                rusqlite::params![id, desc, creator],
+            )
+            .expect("insert");
+        }
+        let sql_says: Vec<String> = conn
+            .prepare(&format!(
+                "SELECT i.id FROM issues i WHERE {} ORDER BY i.id",
+                capture_shell_sql()
+            ))
+            .expect("prepare")
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows");
+        let rust_says: Vec<String> = cases
+            .iter()
+            .filter(|(_, creator, desc)| {
+                let mut r = IssueRow {
+                    creator: (*creator).into(),
+                    desc: (*desc).into(),
+                    status: "backlog".into(),
+                    ..Default::default()
+                };
+                r.id = "x".into();
+                is_capture_shell(&r)
+            })
+            .map(|(id, _, _)| (*id).to_string())
+            .collect();
+        assert_eq!(sql_says, rust_says, "the two predicates must agree row for row");
+        // POSITIVE CONTROL: if this were empty both sides would agree
+        // vacuously, which is the most reassuring output a dead check produces.
+        assert!(
+            rust_says.len() >= 4,
+            "the fixtures must actually contain capture shells; got {rust_says:?}"
+        );
+    }
+
     /// AF-616: a fold the SERVER guessed must not read like one a lane
     /// DECLARED. Both paths write `capture folded into <ID>`; only the
     /// adjacency-chosen one carries the marker.
@@ -5838,8 +6246,8 @@ column=silent type:code=outranked(2)"
             &groups(&["amux"]),
         );
         for want in [
-            "Deployed to prod",
-            "Confirmed working in prod",
+            "Deployed to prod (if this card has no deployment target, note why)",
+            "Confirmed working in prod (if this card has no deployment target, note why)",
             "Zero regressions",
         ] {
             assert!(
@@ -5888,7 +6296,9 @@ column=silent type:code=outranked(2)"
             &groups(&["amux"]),
         );
         assert!(
-            only_marker.iter().any(|g| g == "Confirmed working in prod"),
+            only_marker
+                .iter()
+                .any(|g| g == "Confirmed working in prod (if this card has no deployment target, note why)"),
             "a marker-only gate holds no rule and must fall through, not open the gate: {only_marker:?}"
         );
     }

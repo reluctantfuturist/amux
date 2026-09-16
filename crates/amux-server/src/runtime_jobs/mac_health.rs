@@ -31,7 +31,7 @@
 //!    zombies owned by another application are reported and left alone.
 //!
 //! 6. **SIP-protected indexing daemons pegged hot** (`fseventsd`, `ecosystemd`,
-//!    `ecosystemanalyti`, `mds*`). `top_memory_consumers` below had already
+//!    `ecosystemanalyti`, `mds*`). the earlier resident-memory ranking had already
 //!    caught `fseventsd` holding 8.8GB in one process, and the 2026-09-11
 //!    memory-exhaustion incident (swap 20.7/21.5GB, `fseventsd` 100%+ CPU for
 //!    over 11 days uninterrupted) confirmed it cannot be reaped the way
@@ -478,36 +478,6 @@ fn test_pane_grace_s() -> u64 {
     std::env::var("AMUX_TEST_PANE_GRACE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(1800)
 }
 
-/// The top memory consumers, aggregated by command, as one log line.
-///
-/// Printed only under pressure, because that is when somebody needs to know
-/// WHERE the memory went — and a ranking is the thing a swap percentage cannot
-/// tell you. Measured on this host it was the discriminator: claude 14.8 GB
-/// over 55 processes, and fseventsd holding 8.8 GB in ONE process, which is a
-/// system daemon no scheduler should be killing.
-fn top_memory_consumers(n: usize) -> String {
-    let Ok(out) = std::process::Command::new("ps").args(["-eo", "rss=,comm="]).output() else {
-        return String::from("(unavailable)");
-    };
-    let mut by_cmd: std::collections::HashMap<String, (u64, usize)> = std::collections::HashMap::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let line = line.trim();
-        let Some((rss, comm)) = line.split_once(char::is_whitespace) else { continue };
-        let Ok(rss) = rss.trim().parse::<u64>() else { continue };
-        let name = comm.trim().rsplit('/').next().unwrap_or(comm.trim()).to_string();
-        let e = by_cmd.entry(name).or_insert((0, 0));
-        e.0 += rss;
-        e.1 += 1;
-    }
-    let mut rows: Vec<_> = by_cmd.into_iter().collect();
-    rows.sort_by_key(|(_, (rss, _))| std::cmp::Reverse(*rss));
-    rows.iter()
-        .take(n)
-        .map(|(cmd, (rss, procs))| format!("{cmd}={:.1}GB/{procs}p", *rss as f64 / 1_048_576.0))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn mem_reap_swap_pct() -> f64 {
     std::env::var("AMUX_MEM_REAP_SWAP_PCT").ok().and_then(|v| v.parse().ok()).unwrap_or(85.0)
 }
@@ -530,9 +500,27 @@ fn is_indexing_daemon(name: &str) -> bool {
     INDEXING_DAEMON_NAMES.iter().any(|w| name.starts_with(w))
 }
 
+/// Whether a `.metadata_never_index` sentinel can plausibly quiet this daemon.
+///
+/// THE ARM ABOVE CANNOT REACH `fseventsd`, AND SAYING SO IS THE POINT.
+/// `.metadata_never_index` is a SPOTLIGHT opt-out: it stops `mds`/`mds_stores`
+/// from ENTERING a path into the index. `fseventsd` is a different daemon that
+/// journals filesystem events for the whole volume, and it does that whether or
+/// not Spotlight indexes the path. Measured 2026-09-14: `~/Dev` is fully
+/// excluded (`mdfind -onlyin ~/Dev -count` = 0) while `fseventsd` sat at
+/// 108-112% CPU for a fifteenth consecutive day. The exclusion is still worth
+/// doing for the mds family; it is simply not a lever on this one.
+///
+/// Without this split the tick logs "every known churn source is already
+/// excluded" beside `fseventsd=108%`, which reads as "the remedy is applied and
+/// working" when the remedy was never connected to that daemon. Two lanes have
+/// now spent time adding exclusions expecting fseventsd to fall.
+fn spotlight_exclusion_can_reach(name: &str) -> bool {
+    !name.starts_with("fseventsd")
+}
+
 /// `(name, %cpu)` for every watched indexing daemon currently above the
-/// threshold. Reuses the same `ps -eo` shape as `top_memory_consumers` rather
-/// than inventing a second process-listing convention.
+/// threshold. CPU discovery is separate from the compressed-memory snapshot.
 fn hot_indexing_daemons(above: f64) -> Vec<(String, f64)> {
     let Ok(out) = std::process::Command::new("ps").args(["-eo", "%cpu=,comm="]).output() else {
         return Vec::new();
@@ -745,12 +733,17 @@ fn one_pass() {
                 tracing::info!(job = JOB, pane = %name, "mac-health: reaped a stale test pane under memory pressure");
             }
         }
+        let memory = super::memory_consumers::snapshot();
         tracing::warn!(
             job = JOB,
+            measured = memory.measured,
+            n_considered = memory.n_considered,
+            memory_metric = memory.metric,
+            why_unmeasured = ?memory.why_unmeasured,
             swap_pct = swap_pct.unwrap_or(-1.0) as i64,
             threshold_pct = mem_reap_swap_pct() as i64,
             panes_reaped,
-            top_consumers = %top_memory_consumers(5),
+            top_consumers = ?memory.consumers,
             knob = "AMUX_MEM_REAP_SWAP_PCT",
             "mac-health: host is under memory pressure — reaped amux's own stale test panes. \
              Anything named above that is not amux's is a human's call, not this job's."
@@ -795,6 +788,23 @@ fn one_pass() {
             tracing::debug!(
                 job = JOB, daemons = %daemons_str,
                 "mac-health: indexing daemon(s) hot but every known churn source is already excluded"
+            );
+        }
+        // Say which of the hot daemons this arm CANNOT help, every time it runs.
+        // Otherwise the two lines above are the only signal and both imply the
+        // lever applies to everything in `daemons_str`.
+        let unreachable = hot_daemons
+            .iter()
+            .filter(|(n, _)| !spotlight_exclusion_can_reach(n))
+            .map(|(n, c)| format!("{n}={c:.0}%"))
+            .collect::<Vec<_>>();
+        if !unreachable.is_empty() {
+            tracing::warn!(
+                job = JOB,
+                daemons = %unreachable.join(" "),
+                measured = true,
+                verdict = "spotlight_exclusion_cannot_reach_daemon",
+                "mac-health: these hot daemons are NOT addressable by Spotlight exclusion — they                  journal volume events regardless of what is indexed. Adding more exclude paths                  will not lower them. fseventsd is also SIP-protected (csrutil enabled, binary                  flagged restricted), so no signal reaches it either: a reboot on the owner's                  schedule is the only thing that clears it (MO-3326)"
             );
         }
     }
@@ -935,8 +945,7 @@ mod tests {
             let p = swap_used_pct().expect("swap must be measurable on macOS — check SYSCTL_PATHS");
             assert!((0.0..=100.0).contains(&p), "swap pct out of range: {p}");
         }
-        let top = top_memory_consumers(3);
-        assert!(!top.is_empty(), "the consumer ranking must never render as an empty string");
+        // The memory snapshot has its own native and malformed-output controls.
     }
 
     #[test]
@@ -1055,6 +1064,28 @@ mod ps_row_tests {
         assert_eq!(ppid, 1, "orphaned to init");
         assert!(cmd.contains("Google Chrome"));
         assert!(cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile"));
+    }
+
+    /// The arm drops Spotlight sentinels and then reports on daemons it cannot
+    /// affect. This pins WHICH ones it cannot, because the whole failure mode is
+    /// a log line that reads as "remedy applied and working" over a daemon the
+    /// remedy never touched. If someone adds fseventsd back to the reachable
+    /// set, this goes red rather than the fleet quietly re-learning it.
+    #[test]
+    fn spotlight_exclusion_is_not_claimed_to_reach_fseventsd() {
+        // Not reachable: journals volume events regardless of what is indexed,
+        // verified 2026-09-14 with ~/Dev fully excluded and fseventsd at 110%.
+        assert!(!spotlight_exclusion_can_reach("fseventsd"));
+        // `ps comm` truncation must not smuggle it back in as "reachable".
+        assert!(!spotlight_exclusion_can_reach("fseventsd_foo"));
+        // The mds family IS reachable — that is why the arm still exists, and a
+        // change that made this blanket-false would quietly disable a real fix.
+        for reachable in ["mds", "mds_stores", "mdworker", "mdworker_shared", "ecosystemd"] {
+            assert!(
+                spotlight_exclusion_can_reach(reachable),
+                "{reachable} is addressable by a Spotlight exclusion and must stay so"
+            );
+        }
     }
 
     #[test]

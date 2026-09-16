@@ -341,8 +341,13 @@ pub fn reap_notice(profile: &str, reason: ReapReason) -> String {
          survived.\n\n\
          Reopen it whenever you need it:\n\
          POST /api/browser/start {{\"profile\":\"{profile}\"}}\n\n\
+         IF YOU WERE DRIVING IT OVER RAW CDP, that is why: the activity arm counts \
+         amux browser verbs, and raw CDP traffic goes straight to Chrome where the \
+         reaper cannot see it. Send POST /api/browser/keepalive while you work and \
+         the clock resets; `skills/chrome-cdp/scripts/cdp.mjs` does this for you on \
+         every command (AMUX-4685).\n\n\
          To stop this happening mid-task, widen or disable the window: \
-         AMUX_BROWSER_ACTIVITY_REAP_S, AMUX_BROWSER_TTL_S, AMUX_BROWSER_REAP_AFTER_S \
+         AMUX_BROWSER_ACTIVITY_REAP_S, AMUX_BROWSER_TTL_S, AMUX_BROWSER_IDLE_REAP_S \
          (0 disables an arm) in ~/.amux/server.env.",
         reason.sentence()
     )
@@ -393,10 +398,11 @@ async fn tick(home: &std::path::Path, store: Option<&crate::db::SharedStore>) ->
     // pages. Disabling one must not silently disable the other — they were
     // independent knobs the moment there were two of them.
     reap_stale_profiles(home).await;
-    let after_s = reap_after_s();
-    if after_s == 0 {
-        return vec![];
-    }
+    tick_with_limits(home, store, reap_after_s(), activity_reap_s(), ttl_s()).await
+}
+
+async fn tick_with_limits(home: &std::path::Path, store: Option<&crate::db::SharedStore>,
+    after_s: u64, activity_ttl: u64, ttl: u64) -> Vec<String> {
     let mut reaped = vec![];
     let now = now_f64();
     // `None` when the process never recorded a boot (tests), which the log line
@@ -405,8 +411,6 @@ async fn tick(home: &std::path::Path, store: Option<&crate::db::SharedStore>) ->
     let boot = crate::runtime_jobs::heartbeat::boot_at();
     let prior = read_idle(home);
     let mut next: HashMap<String, f64> = HashMap::new();
-    let ttl = ttl_s();
-    let activity_ttl = activity_reap_s();
     for (profile, owner, started, _pid, port, last_verb) in crate::integrations::browser::running_all() {
         // ACTIVITY ARM: no verb for N seconds = abandoned, release it. Checked
         // before the page-presence arms because it fires fastest and the reason
@@ -456,6 +460,8 @@ async fn tick(home: &std::path::Path, store: Option<&crate::db::SharedStore>) ->
             reaped.push(profile);
             continue;
         }
+        // Disabling continuous-empty expiry must not disable the two age limits.
+        if after_s == 0 { continue; }
         // CDP SILENCE IS NOT EMPTINESS. A browser that will not answer is left
         // alone: killing it would turn a transient wedge into a destroyed
         // session, and this job's whole safety argument rests on knowing there
@@ -560,21 +566,28 @@ mod tests {
         let db = tempfile::tempdir().unwrap();
         let store: crate::db::SharedStore =
             std::sync::Arc::new(crate::db::Store::open(&db.path().join("t.db")).unwrap());
+        // AMUX-4645: an owner name no real lane can have. The enqueue refuses a
+        // paused, isolated or archived target by reading the REAL sessions dir,
+        // and this test deliberately does not take HomeGuard (see below), so a
+        // fleet lane sharing the old literal name ("gtm-engine", paused on the
+        // amux host since 2026-09-14) made this fail on that host and pass in CI.
+        let owner = format!("reaper-notice-{}", ulid::Ulid::new().to_string().to_lowercase());
 
         // Prove the target exists through the durable worker row that the
         // enqueue chokepoint already understands. Do not take HomeGuard here:
         // this test also exercises the process-global browser registry, and a
         // parallel browser test can take those two locks in the opposite order.
         // The first guarded draft wedged 14 unrelated tests in the full suite.
+        let row_owner = owner.clone();
         store
-            .write_async(|conn| {
+            .write_async(move |conn| {
                 conn.execute(
                     "INSERT INTO _amux_workers \
                      (id, display_name, name_aliases, cwd, provider, model, state, created_at, updated_at) \
-                     VALUES ('wrk_reaper_notice', 'gtm-engine', '[]', '/tmp', 'claude', \
+                     VALUES ('wrk_reaper_notice', ?1, '[]', '/tmp', 'claude', \
                              'test', '{\"state\":\"stopped\"}', \
                              '2026-09-04T00:00:00Z', '2026-09-04T00:00:00Z')",
-                    [],
+                    [&row_owner],
                 )?;
                 Ok(crate::db::WriteOutcome {
                     applied: true,
@@ -584,18 +597,11 @@ mod tests {
             .await
             .unwrap();
 
-        // SAFETY: this is the only test that mutates these two variables, and
-        // both are restored below before the test returns.
-        let prior_after = std::env::var("AMUX_BROWSER_REAP_AFTER_S").ok();
-        let prior_act = std::env::var("AMUX_BROWSER_ACTIVITY_REAP_S").ok();
-        unsafe { std::env::set_var("AMUX_BROWSER_REAP_AFTER_S", "60") };
-        unsafe { std::env::set_var("AMUX_BROWSER_ACTIVITY_REAP_S", "1") };
-
         crate::integrations::browser::test_clear_running();
-        crate::integrations::browser::test_seed_running_port("hubspot", "gtm-engine", u32::MAX, 1);
+        crate::integrations::browser::test_seed_running_port("hubspot", &owner, u32::MAX, 1);
 
         let reaped = crate::integrations::browser::test_with_kill_capture(async {
-            let reaped = tick(home.path(), Some(&store)).await;
+            let reaped = tick_with_limits(home.path(), Some(&store), 0, 1, 0).await;
             assert!(
                 crate::integrations::browser::test_kill_commands().is_empty(),
                 "u32::MAX reached /bin/kill through the real reaper stop path"
@@ -626,17 +632,15 @@ mod tests {
             out
         };
         crate::integrations::browser::test_clear_running();
-        match prior_after {
-            Some(v) => unsafe { std::env::set_var("AMUX_BROWSER_REAP_AFTER_S", v) },
-            None => unsafe { std::env::remove_var("AMUX_BROWSER_REAP_AFTER_S") },
-        }
-        match prior_act {
-            Some(v) => unsafe { std::env::set_var("AMUX_BROWSER_ACTIVITY_REAP_S", v) },
-            None => unsafe { std::env::remove_var("AMUX_BROWSER_ACTIVITY_REAP_S") },
-        }
+        crate::integrations::browser::test_seed_running_port("ttl-only", &owner, u32::MAX, 1);
+        let expired = crate::integrations::browser::test_with_kill_capture(async {
+            tick_with_limits(home.path(), Some(&store), 0, 0, 1).await
+        }).await;
+        assert_eq!(expired, vec!["ttl-only".to_string()]);
+        crate::integrations::browser::test_clear_running();
 
         let mine: Vec<&(String, String)> =
-            rows.iter().filter(|(s, _)| s == "gtm-engine").collect();
+            rows.iter().filter(|(s, _)| *s == owner).collect();
         assert_eq!(
             mine.len(),
             1,
@@ -697,13 +701,39 @@ mod tests {
         assert!(c.contains("no page open"), "{c}");
     }
 
+    /// THE REMEDY A CDP DRIVER CAN ACTUALLY USE (AMUX-4685).
+    ///
+    /// Before this, the only remedy the notice offered was editing
+    /// AMUX_BROWSER_ACTIVITY_REAP_S in ~/.amux/server.env, which needs a server
+    /// restart. So a lane on a ten-minute browser task had to choose between
+    /// restarting the fleet's server and being interrupted, and the notice said
+    /// nothing about the actual cause: raw CDP traffic goes straight to Chrome,
+    /// where the activity arm cannot see it.
+    ///
+    /// The reaper cannot close that gap by looking. Chrome's HTTP endpoints
+    /// expose no attachment state, verified with a debugger attached AND running
+    /// Runtime.evaluate: /json/list still reports webSocketDebuggerUrl on the
+    /// driven target and /json/version carries version strings only, byte for
+    /// byte what a detached browser answers. The driver has to say so.
+    #[test]
+    fn the_notice_names_the_keepalive_a_cdp_driver_can_send() {
+        let n = reap_notice("default", ReapReason::NoActivity { since_verb_s: 600, window_s: 600 });
+        assert!(n.contains("/api/browser/keepalive"), "the route is not named: {n}");
+        assert!(n.contains("raw CDP"), "nor the cause it addresses: {n}");
+        assert!(
+            n.contains("cdp.mjs"),
+            "nor that the sanctioned driver already sends it, which is the difference \
+             between a remedy you must remember and one you already have: {n}"
+        );
+    }
+
     /// The knobs are named. Without them the only response to "amux closed my
     /// browser mid-task" is to hit start again and wait for it to happen twice
     /// more.
     #[test]
     fn the_notice_names_the_knobs_that_prevent_a_recurrence() {
         let n = reap_notice("default", ReapReason::Ttl { age_s: 7200, ttl_s: 3600 });
-        for knob in ["AMUX_BROWSER_ACTIVITY_REAP_S", "AMUX_BROWSER_TTL_S", "AMUX_BROWSER_REAP_AFTER_S"] {
+        for knob in ["AMUX_BROWSER_ACTIVITY_REAP_S", "AMUX_BROWSER_TTL_S", "AMUX_BROWSER_IDLE_REAP_S"] {
             assert!(n.contains(knob), "{knob} is not offered: {n}");
         }
     }

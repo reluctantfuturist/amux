@@ -92,6 +92,7 @@ pub mod ids {
     pub const PIPE_RECONCILE: &str = "pipe-reconcile";
     pub const INVARIANTS: &str = "invariants-monitor";
     pub const SCHEDULER: &str = "scheduler";
+    pub const HOST_METRICS: &str = "host-metrics";
     pub const ORCH_RUNTIME: &str = "orchestrator-runtime";
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
@@ -117,6 +118,7 @@ pub mod ids {
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
     pub const QUEUE_DISPOSITION: &str = "queue-disposition";
+    pub const MESSAGE_CAPTURE: &str = "message-capture";
     pub const MAC_HEALTH: &str = "mac-health";
     pub const ACCOUNTABILITY_NUDGE: &str = "accountability-nudge";
     pub const CONTEXT_HEALTH: &str = "context-health";
@@ -124,6 +126,7 @@ pub mod ids {
     pub const STATUS_HISTORY: &str = "status-history";
     pub const TOKEN_LEDGER: &str = "token-ledger";
     pub const BOARD_HYGIENE: &str = "board-hygiene";
+    pub const RECORDINGS_TRANSCRIBE: &str = "recordings-transcribe";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -159,13 +162,16 @@ pub const ALL_IDS: &[&str] = &[
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
     ids::QUEUE_DISPOSITION,
+    ids::MESSAGE_CAPTURE,
     ids::MAC_HEALTH,
     ids::ACCOUNTABILITY_NUDGE,
     ids::CONTEXT_HEALTH,
     ids::DISK_WATCH,
+    ids::HOST_METRICS,
     ids::STATUS_HISTORY,
     ids::TOKEN_LEDGER,
     ids::BOARD_HYGIENE,
+    ids::RECORDINGS_TRANSCRIBE,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -316,6 +322,18 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/debug/downtime"),
     },
     Doc {
+        id: ids::MESSAGE_CAPTURE,
+        name: "Message capture recovery",
+        purpose: "Resumes durable pending message-to-card capture after interruption, using the original history row and semantic intake without resending commands. Historical unlinked messages require explicit reviewed attribution.",
+        env: &[EnvControl {
+            var: "AMUX_MESSAGE_CAPTURE_SECS",
+            effect: "0 disables recovery; otherwise the loop runs every 90 seconds (positive values do not change its interval)",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/history"),
+    },
+    Doc {
         id: ids::QUEUE_DISPOSITION,
         name: "Queue disposition",
         purpose: "Tells a lane which of its todo cards auto-pickup has already stopped offering, and asks for one of three dispositions. Files ONE card per lane and updates it; it never retires or retypes a card itself.",
@@ -330,7 +348,7 @@ pub const CATALOG: &[Doc] = &[
     Doc {
         id: ids::STORAGE,
         name: "Storage retention",
-        purpose: "Prunes seven append-only tables and three cache directories on a timer, and rotates the server log.",
+        purpose: "Bounds append-only history, caches, diagnostic run logs and build artifacts; preserves referenced uploads and expires transcript cache entries.",
         env: &[EnvControl {
             var: "AMUX_STORAGE_SWEEP_SECS",
             effect: "sweep seconds; 0 stops the sweep",
@@ -439,17 +457,17 @@ pub const CATALOG: &[Doc] = &[
             EnvControl {
                 var: "AMUX_BROWSER_ACTIVITY_REAP_S",
                 effect: "seconds since last verb (navigate/screenshot/action) before release (default 300 = 5 min); 0 disables this arm",
-                off: Some("0"),
+                off: None, // disables one expiry arm, not the running job
             },
             EnvControl {
                 var: "AMUX_BROWSER_IDLE_REAP_S",
                 effect: "seconds a profile must be continuously empty (no real pages) before release (default 3600); 0 disables this arm",
-                off: Some("0"),
+                off: None, // disables one expiry arm, not the running job
             },
             EnvControl {
                 var: "AMUX_BROWSER_TTL_S",
                 effect: "hard age ceiling — any browser older than this is released even with open pages (default 14400 = 4 h); 0 disables",
-                off: Some("0"),
+                off: None, // disables one expiry arm, not the running job
             },
             EnvControl {
                 var: "AMUX_BROWSER_REAP_TICK_S",
@@ -627,6 +645,18 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/reclaim/scan"),
     },
     Doc {
+        id: ids::HOST_METRICS,
+        name: "Host metrics history",
+        purpose: "Samples the host analysis /api/metrics/host serves (CPU, load, memory, swap, disk, process counts) into host_metrics, so utilization over time is answerable rather than only right now. A failed probe is recorded as an unmeasured row, never as a gap.",
+        env: &[EnvControl {
+            var: "AMUX_HOST_METRICS_EVERY_SECS",
+            effect: "seconds between samples (default 300, floored at 60; spawn_periodic clamps 0 to 1s, so this knob has no off value)",
+            off: None,
+        }],
+        pref: None,
+        detail: Some("/api/metrics/host/history"),
+    },
+    Doc {
         id: ids::STATUS_HISTORY,
         name: "Status history",
         purpose: "Samples each live worker's derived status so time-driven and subagent-driven state changes remain explainable after the fact.",
@@ -668,6 +698,18 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::RECORDINGS_TRANSCRIBE,
+        name: "Recording transcripts",
+        purpose: "Transcribes recordings synced from the Record tab with a local whisper.cpp model and writes each transcript beside its audio; without it recordings sync but never become text.",
+        env: &[EnvControl {
+            var: "AMUX_RECORDINGS_TRANSCRIBE_SECS",
+            effect: "tick seconds; 0 disables the job",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: Some("/api/recordings/config"),
     },
 ];
 
@@ -1163,19 +1205,25 @@ pub fn outcome_for(id: &str) -> Option<String> {
         }),
         ids::STORAGE => super::storage::last_report().map(|r| {
             format!(
-                "{} table(s) swept, {} file(s) removed, {} freed",
+                "{} table(s) swept, {} file(s) and {} directory(s) removed, {} freed, {} cache entries expired{}",
                 r.tables.len(),
-                r.files_removed,
-                human_bytes(r.bytes_freed + r.rotated_bytes)
+                r.files_removed + r.rotated_logs_removed,
+                r.dirs_removed + r.run_logs.removed,
+                human_bytes(r.bytes_freed + r.rotated_logs_freed + r.dir_bytes_freed + r.run_logs.bytes_freed),
+                r.memory_entries_removed,
+                if r.upload_refs_error.is_some() || !r.run_logs.measured || r.diagnostic_dirs.iter().any(|(_, d)| !d.measured) { "; some cleanup deferred (see storage diagnostics)" } else { "" }
             )
         }),
         ids::SCAN => crate::orchestrator::scan::last_scan_state().map(|s| {
             format!(
-                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s)",
+                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s), {} process exit(s), {} exit probe/apply failure(s), {} stale exit observation(s)",
                 s.report.scanned.len(),
                 s.report.demoted_structured.len(),
                 s.report.demoted_native.len(),
                 s.report.capture_failures.len(),
+                s.report.process_exits.len(),
+                s.report.process_exit_failures.len(),
+                s.report.stale_process_exits.len(),
             )
         }),
         _ => None,

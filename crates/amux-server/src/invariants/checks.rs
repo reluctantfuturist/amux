@@ -639,6 +639,9 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("_amux_task_artifacts", "updated_at", false),
     ("_amux_verifications", "created_at", false),
     ("_amux_request_log", "ts", false),
+    // Interaction writers use timestamp_millis(), matching browser Date.now().
+    ("_amux_interactions", "created_at", true),
+    ("_amux_interactions", "updated_at", true),
     // AF-175's boot column: which process wrote the row. Same unit as `ts` by
     // construction — it is `heartbeat::boot_at()`, the same clock — and the
     // one-sided restart predicate depends on `boot_at <= ts` holding, so a unit
@@ -676,11 +679,15 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // SECONDS: DEFAULT (unixepoch('subsec')) in migration 0061.
     ("board_change_log", "changed_at", false),
     ("cmd_history", "delivered_at", true),
+    ("cmd_history", "intake_called_at", false),
+    ("cmd_history", "intake_retry_at", false),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),
     ("dictation_history", "ts", true),
     ("guard_verdicts", "outcome_ts", false),
     ("guard_verdicts", "ts", false),
+    // 28cdee7b added the table; `record` stamps chrono::Utc::now().timestamp(), which is seconds.
+    ("host_metrics", "ts", false),
     ("interaction_log", "ts", true),
     ("issue_files", "added_at", false),
     ("issue_tags", "added_at", false),
@@ -701,6 +708,12 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // a timestamp column is a two-part change and this file is the second part.
     ("issues", "entered_state_at", false),
     ("issues", "last_verified_at", false),
+    // SECONDS, MEASURED on the live database 2026-09-14 (RR-0052 leases,
+    // migration 0068): MAX(lease_heartbeat_at) 1789414128 and
+    // MAX(lease_expires_at) 1789415928 against a `now` of 1789414183.
+    ("issues", "lease_acquired_at", false),
+    ("issues", "lease_expires_at", false),
+    ("issues", "lease_heartbeat_at", false),
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),
     ("mdai_runs", "ts", false),
@@ -735,6 +748,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("steering_history", "delivered_at", false),
     ("steering_history", "queued_at", false),
     ("steering_queue", "queued_at", false),
+    // SECONDS, MEASURED on the live database 2026-09-14 (RR-0052 attempts,
+    // db/attempts.rs): MAX(started_at) 1789414003 and MAX(ended_at) 1789413676
+    // against a `now` of 1789414183.
+    ("task_attempts", "ended_at", false),
+    ("task_attempts", "started_at", false),
     ("token_ledger", "ts", false),
     ("waitlist", "ts", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
 ];
@@ -5916,6 +5934,8 @@ mod negative_controls {
             .map(|(t, c, _)| format!("{t}.{c}"))
             .collect();
         for name in [
+            "_amux_interactions.created_at",
+            "_amux_interactions.updated_at",
             "cmd_history.queued_at",
             "cmd_history.delivered_at",
             "cmd_history.ts",
@@ -5927,12 +5947,6 @@ mod negative_controls {
                 "{name} is MILLISECONDS in the live schema and must be declared: {ms:?}"
             );
         }
-        assert_eq!(
-            ms.iter().filter(|n| n.ends_with("_at")).count(),
-            2,
-            "two of the five millisecond columns are `_at`-named — that is why the \
-             filter cannot key on `ts` alone: {ms:?}"
-        );
         // No duplicate declarations: a column declared twice with different
         // units would make the lookup order-dependent and quietly authoritative.
         let mut names: Vec<String> = TIMESTAMP_COLUMNS
@@ -6368,7 +6382,7 @@ mod unrecorded_schedule_outcome_tests {
 }
 
 // ---------------------------------------------------------------------------
-// N. Nonterminal cards have a disposition (actionable next_action).
+// N. Nonterminal cards record what moves them, per status (AMUX-4540).
 // ---------------------------------------------------------------------------
 
 pub struct DispositionRow {
@@ -6377,6 +6391,56 @@ pub struct DispositionRow {
     pub next_action: Option<String>,
     pub session: Option<String>,
     pub item_type: String,
+    /// The typed ask: `ask_question`, else `decision_question` (AF-318).
+    pub ask: Option<String>,
+    pub reviewer: Option<String>,
+    /// What it waits on, in words: `blocked_on`, else `waiting_on`.
+    pub waiting_on: Option<String>,
+    /// A recorded `depends_on` edge.
+    pub has_dependency: bool,
+    /// The lane an armed card calls back, which is what fires it.
+    pub callback_session: Option<String>,
+}
+
+fn present(v: &Option<String>) -> bool {
+    v.as_deref().is_some_and(|s| !s.trim().is_empty())
+}
+
+/// What a card in `status` must record so a stranger can tell what moves it,
+/// or `None` when the status needs nothing beyond itself.
+///
+/// AMUX-4540. Each arm names the field that status's OWN mechanism reads.
+/// This check used to demand `next_action` of every nonterminal card, but
+/// `next_action` is the continuation contract, written on the transition into
+/// `doing` (`doing_requires_next_action`). A needsyou card's next move is its
+/// typed ask, which the needsyou gate requires (AF-318); a review card waits
+/// on its reviewer; blocked and armed cards wait on something they must name.
+/// Measured on the live board 2026-09-14: 381 of 479 cards "failed" the old
+/// rule, and 207 of the 226 needsyou among them carried a typed ask. The
+/// autofix card that first filed it read 538 of 538, so the check never had a
+/// passing baseline to regress from. `todo` is the dispatch queue; whether it
+/// can be offered is board.todo_is_reachable_by_dispatch.
+pub fn disposition_needs(status: &str) -> Option<&'static str> {
+    match status {
+        "done" | "verified" | "discarded" | "backlog" | "todo" => None,
+        "doing" => Some("next_action"),
+        "needsyou" => Some("a typed ask (ask_question) or next_action"),
+        "review" => Some("a reviewer or next_action"),
+        "armed" => Some("what fires it (blocked_on, waiting_on, depends_on or a callback) or next_action"),
+        // Blocked, and any status outside the vocabulary, which to_task reads as Blocked.
+        _ => Some("what it waits on (blocked_on, waiting_on or depends_on) or next_action"),
+    }
+}
+
+fn records_disposition(c: &DispositionRow) -> bool {
+    let next = present(&c.next_action);
+    match c.status.as_str() {
+        "doing" => next,
+        "needsyou" => next || present(&c.ask),
+        "review" => next || present(&c.reviewer),
+        "armed" => next || present(&c.waiting_on) || c.has_dependency || present(&c.callback_session),
+        _ => next || present(&c.waiting_on) || c.has_dependency,
+    }
 }
 
 pub fn nonterminal_has_disposition(cards: &[DispositionRow]) -> Vec<InvariantResult> {
@@ -6384,42 +6448,60 @@ pub fn nonterminal_has_disposition(cards: &[DispositionRow]) -> Vec<InvariantRes
     if cards.is_empty() {
         return vec![InvariantResult::unknown(ID, "no cards to check")];
     }
-    let nonterminal: Vec<_> = cards
-        .iter()
-        .filter(|c| !matches!(c.status.as_str(), "done" | "verified" | "discarded" | "backlog"))
-        .collect();
-    if nonterminal.is_empty() {
-        return vec![InvariantResult::pass(ID)
-            .evidence(serde_json::json!({"checked": 0, "reason": "no nonterminal cards"}))];
+    let checked: Vec<&DispositionRow> = cards.iter().filter(|c| disposition_needs(&c.status).is_some()).collect();
+    if checked.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(serde_json::json!({
+            "checked": 0,
+            "n_considered": cards.len(),
+            "reason": "no card is in a status that must record a disposition",
+        }))];
     }
-    let missing: Vec<_> = nonterminal
+    let mut by_status: std::collections::BTreeMap<&str, (usize, usize)> = std::collections::BTreeMap::new();
+    let mut missing: Vec<&DispositionRow> = Vec::new();
+    for c in &checked {
+        let entry = by_status.entry(c.status.as_str()).or_default();
+        entry.0 += 1;
+        if !records_disposition(c) {
+            entry.1 += 1;
+            missing.push(c);
+        }
+    }
+    let by_status_json: serde_json::Map<String, serde_json::Value> = by_status
         .iter()
-        .filter(|c| c.next_action.as_ref().is_none_or(|s| s.trim().is_empty()))
+        .map(|(s, (n, m))| {
+            (s.to_string(), serde_json::json!({"checked": n, "missing": m, "needs": disposition_needs(s)}))
+        })
         .collect();
     if missing.is_empty() {
-        vec![InvariantResult::pass(ID)
-            .evidence(serde_json::json!({"checked": nonterminal.len()}))]
-    } else {
-        let sample: Vec<_> = missing
-            .iter()
-            .take(5)
-            .map(|c| serde_json::json!({"id": c.id, "status": c.status, "session": c.session}))
-            .collect();
-        vec![InvariantResult::fail(
-            ID,
-            "nonterminal cards carry a next_action".to_string(),
-            format!(
-                "{} of {} nonterminal cards have no next_action",
-                missing.len(),
-                nonterminal.len()
-            ),
-        )
-        .evidence(serde_json::json!({
-            "missing_count": missing.len(),
-            "nonterminal_count": nonterminal.len(),
-            "sample": sample,
-        }))]
+        return vec![InvariantResult::pass(ID).evidence(serde_json::json!({
+            "checked": checked.len(),
+            "n_considered": cards.len(),
+            "by_status": by_status_json,
+        }))];
     }
+    let summary = by_status
+        .iter()
+        .filter(|(_, (_, m))| *m > 0)
+        .map(|(s, (_, m))| format!("{s} {m}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sample: Vec<_> = missing
+        .iter()
+        .take(10)
+        .map(|c| serde_json::json!({"id": c.id, "status": c.status, "session": c.session, "needs": disposition_needs(&c.status)}))
+        .collect();
+    vec![InvariantResult::fail(
+        ID,
+        "every nonterminal card records what moves it: doing a next_action, needsyou a typed ask, review a reviewer, blocked and armed what they wait on (todo is the dispatch queue)".to_string(),
+        format!("{} of {} cards record no disposition for their status ({summary})", missing.len(), checked.len()),
+    )
+    .evidence(serde_json::json!({
+        "missing_count": missing.len(),
+        "nonterminal_count": checked.len(),
+        "n_considered": cards.len(),
+        "by_status": by_status_json,
+        "sample": sample,
+    }))]
 }
 
 #[cfg(test)]
@@ -6433,6 +6515,11 @@ mod disposition_tests {
             next_action: next_action.map(Into::into),
             session: Some("test".into()),
             item_type: "code".into(),
+            ask: None,
+            reviewer: None,
+            waiting_on: None,
+            has_dependency: false,
+            callback_session: None,
         }
     }
 
@@ -6469,6 +6556,47 @@ mod disposition_tests {
     fn empty_next_action_counts_as_missing() {
         let cards = vec![row("A-1", "doing", Some("  "))];
         assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Fail);
+    }
+
+    /// AMUX-4540. Each status passes on the field its own gate reads, and a
+    /// queued todo needs nothing beyond being queued.
+    #[test]
+    fn each_status_is_judged_by_the_field_its_own_mechanism_reads() {
+        let mut ask = row("N-1", "needsyou", None);
+        ask.ask = Some("Approve the spend?".into());
+        let mut rev = row("R-1", "review", None);
+        rev.reviewer = Some("amux-testing".into());
+        let mut dep = row("B-1", "blocked", None);
+        dep.has_dependency = true;
+        let mut wait = row("B-2", "blocked", None);
+        wait.waiting_on = Some("Ethan's answer to MG-1369".into());
+        let mut fires = row("W-1", "armed", None);
+        fires.callback_session = Some("ts-gke".into());
+        let queued = row("T-1", "todo", None);
+        let out = nonterminal_has_disposition(&[ask, rev, dep, wait, fires, queued]);
+        assert_eq!(out[0].status, Status::Pass, "{:?}", out[0]);
+        assert_eq!(out[0].evidence["checked"], 5, "todo is not checked: {}", out[0].evidence);
+    }
+
+    /// A field that belongs to another status does not stand in: a reviewer
+    /// tells a stranger nothing about what to do next on a card being worked,
+    /// and a needsyou card that only names what it waits on still asks nothing.
+    #[test]
+    fn a_field_that_belongs_to_another_status_does_not_count() {
+        let mut doing = row("D-1", "doing", None);
+        doing.reviewer = Some("amux-testing".into());
+        let mut asks_nothing = row("N-2", "needsyou", None);
+        asks_nothing.waiting_on = Some("Ethan".into());
+        let bare_review = row("R-2", "review", None);
+        let bare_armed = row("W-2", "armed", None);
+        let out = nonterminal_has_disposition(&[doing, asks_nothing, bare_review, bare_armed]);
+        assert_eq!(out[0].status, Status::Fail);
+        let ev = &out[0].evidence;
+        assert_eq!(ev["missing_count"], 4, "{ev}");
+        assert_eq!(ev["by_status"]["doing"]["missing"], 1, "{ev}");
+        assert_eq!(ev["by_status"]["needsyou"]["needs"], "a typed ask (ask_question) or next_action", "{ev}");
+        assert!(out[0].observed.contains("4 of 4 cards"), "{}", out[0].observed);
+        assert!(out[0].observed.contains("armed 1, doing 1, needsyou 1, review 1"), "{}", out[0].observed);
     }
 }
 

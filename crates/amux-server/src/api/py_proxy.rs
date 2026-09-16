@@ -65,6 +65,7 @@ pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 /// list against the routes mod.rs actually mounts (a view must share the
 /// predicate of the mechanism it describes — ethos rule 1).
 pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
+    ("/api/brex", "tokenized card issuance, webhook budget checks and credential health; disabled until configured (api/brex.rs)"),
     ("/api/_clear_sw", "service-worker cache reset landing page"),
     ("/health", "health + build discriminator"),
     // The /api-prefixed alias for the same handler. Lanes guess this path
@@ -76,10 +77,16 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
         "/api/_clear_sw",
         "service-worker cleanup landing outside the service worker intercept scope (api/static_files.rs)",
     ),
+    (
+        "/api/screen",
+        "loopback-only screenshot capture (api/screen.rs); native, never proxied — \
+         the bytes are of the owner's physical display",
+    ),
     ("/api/calendar.ics", "iCal feed"),
     ("/api/sync", "delta sync"),
     ("/api/events", "SSE stream"),
     ("/api/board", "board/tasks CRUD, gates, contract"),
+    ("/api/board-lifecycle", "durable command decisions and measured planning costs"),
     ("/api/lookup", "explain-selection helper (peek view)"),
     ("/api/tts", "text-to-speech read-aloud synthesis (+ /api/tts/voices)"),
     ("/api/orchestrate", "voice fleet-orchestrator: transcript -> helper-model routing plan (api/orchestrate.rs, AMUX-3074)"),
@@ -123,6 +130,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/criteria", "gate criteria"),
     ("/api/metrics", "metrics"),
     ("/api/reclaim", "disk scan, reclaim findings, treemap, quarantine"),
+    ("/api/recordings", "audio recorder: upload, list, folder config, local transcription (api/recordings.rs)"),
     ("/api/usage", "token usage"),
     ("/api/alert", "owner alerts"),
     ("/api/stats", "daily stats"),

@@ -222,10 +222,13 @@ fn worker_card_and_peek_share_actions_and_the_canonical_file_entry() {
     let inventory_end = inventory_tail.find("function _renderWorkerActionMenu")
         .expect("the shared renderer must follow its inventory");
     let inventory = &inventory_tail[..inventory_end];
+    // 29 SOURCE entries since 9af1c88b: `pause` and `resume` are the two arms of
+    // one ternary, so the source carries both while a worker renders exactly one
+    // of them. This counts the inventory in source, not the rendered menu.
     assert_eq!(
         inventory.matches("{ key: '").count(),
-        27,
-        "the full running Claude worker fixture has 27 shared worker actions"
+        29,
+        "the shared worker-action inventory has 29 source entries (27 actions plus the pause/resume pair)"
     );
 
     let browse_start = app.find("function _browseWorkerFiles(name, source)")
@@ -504,8 +507,27 @@ fn only_the_explicitly_claimed_card_is_live_without_a_synthetic_unclaimed_state(
         app.contains("board-card-live-label\"><span class=\"board-live-dot\"></span>Working now"),
         "a live board card needs an explicit visible label, not only a border or tooltip"
     );
+    // The rule is that a card says "Working now" only when the runtime truth
+    // names THAT card. 6e34096d moved it out of an inline `_liveCard`
+    // expression into a named helper, and this assertion kept demanding the old
+    // spelling, so it failed on a refactor that preserved the rule exactly. A
+    // check pinning a spelling is red for the wrong reason; pin the helper and
+    // the identity test inside it, the way the `_workerExecutionBadge` block a
+    // few lines above already does.
+    let activity_start = app
+        .find("function _boardActivityForCard(item)")
+        .expect("the live-card decision must live in one named helper");
+    let activity_tail = &app[activity_start..];
+    let activity = &activity_tail[..activity_tail.find('\n').unwrap_or(0)
+        + activity_tail[activity_tail.find('\n').unwrap_or(0)..]
+            .find("\n}")
+            .expect("helper must be a complete function")];
     assert!(
-        app.contains("const _liveNow = !!(_liveCard && _liveCard.id === item.id)"),
+        activity.contains("id !== item.id") && activity.contains("return null"),
+        "the helper must refuse any card the runtime truth does not name"
+    );
+    assert!(
+        app.contains("const _liveNow = !!(_activity && _activity.linked)"),
         "only the explicitly claimed card may say Working now"
     );
     for needle in [
@@ -1253,7 +1275,7 @@ fn the_worker_tab_customizer_is_the_grid_glyph() {
 /// into the dedup gate, and after two minutes became a BLOCKED op with a red
 /// banner over a message the worker already had (2026-09-11, two workers).
 #[test]
-fn a_slow_send_waits_for_the_server_instead_of_falling_into_the_outbox() {
+fn a_slow_send_has_a_bounded_outer_deadline() {
     let js = asset("app.js");
     let i = js.find("async function doSend(").expect("doSend exists");
     let j = js[i..].find("async function doKeys(").expect("doKeys follows doSend");
@@ -1263,10 +1285,276 @@ fn a_slow_send_waits_for_the_server_instead_of_falling_into_the_outbox() {
         "doSend aborts at 10s again; on this host /send routinely exceeds that"
     );
     assert!(body.contains("AbortSignal.timeout(90000)"), "doSend keeps a 90s ceiling for a hung server");
-    // And the replay drops an 'uncertain' dedup answer instead of blocking on it.
+    // Uncertain delivery must retain the original durable intent. The executable
+    // dashboard-outage-recovery.mjs contract tests the real response path and
+    // checkmark state, including a negative control restoring the old drop.
+    // Receipt-only automatic retries are covered by e2e/outbox-acceptance-recovery.test.mjs.
+
+}
+
+/// A card-composer send must remove its sent attachments DURABLY (via
+/// _cancelUpload, which deletes the IndexedDB upload row), not just filter the
+/// in-memory array. A plain filter left the durable row behind and
+/// _attachmentRestore re-hydrated every sent file on the next reload, so card
+/// attachment chips piled up with green ticks despite having been delivered
+/// (Ethan, 2026-09-12). sendPeekCmd already did this; the card path had drifted.
+#[test]
+fn a_card_send_clears_its_attachments_durably() {
+    let js = asset("app.js");
+    let i = js.find("async function sendFromInput(").expect("sendFromInput exists");
+    let j = js[i..].find("\n}\n").map(|k| i + k).unwrap_or(js.len());
+    let body = &js[i..j.min(i + 4000)];
     assert!(
-        js.contains("d.submission === 'uncertain'") && js.contains("'uncertain_send_dropped'"),
-        "the outbox replay must drop a 409 submission=uncertain send (with its beacon) rather than \
-         keep it blocked forever"
+        body.contains("_cancelUpload(f)"),
+        "sendFromInput must call _cancelUpload on each sent attachment so the durable \
+         IndexedDB row is removed; a bare array filter leaks it and the chip returns on reload"
+    );
+}
+
+/// A session change must refresh the OPEN worker-details view, not just the
+/// list. The server pushes invalidate:['sessions'] and the client answers with
+/// fetchSessions (AMUX-3503); fetchSessions only re-rendered the list, so the
+/// open peek stayed stale until its own poll or a manual reload (Ethan,
+/// 2026-09-12: "there's a delay and i have to refresh page to see it"). Both the
+/// fetch path and the direct-payload SSE branch must route through the one
+/// helper so they cannot drift.
+#[test]
+fn a_session_update_refreshes_the_open_details_view() {
+    let js = asset("app.js");
+    assert!(
+        js.contains("function _refreshOpenPeekOnSessions"),
+        "the shared open-peek refresh helper must exist so list and details update from one event"
+    );
+    // The helper is CALLED from both the fetch path and the SSE branch (two
+    // call sites, `_refreshOpenPeekOnSessions();`), separate from its one
+    // definition (`function _refreshOpenPeekOnSessions()`). If either call site
+    // is dropped, a session change refreshes only one surface.
+    let calls = js.matches("_refreshOpenPeekOnSessions();").count();
+    assert!(
+        calls >= 2,
+        "expected the open-details refresh to be called from both the fetch path and the SSE \
+         branch (>=2 call sites); found {calls} — a status/queue change would update the list \
+         while the peek stays stale until a manual refresh"
+    );
+}
+
+/// Reconnecting must show the sync checklist draining item by item — the
+/// checkmark list (Ethan, 2026-09-12: "when reconnecting it should show that
+/// list of checkboxes and check marks of different synced things"). The
+/// mechanism (renderBanner's per-item ✔/✘/➤ states) already existed but was
+/// gated behind !quiet, and the reconnect drain ran quiet, so it never showed.
+#[test]
+fn reconnect_shows_the_sync_checklist() {
+    let js = asset("app.js");
+    // The reconnect edge (setOnline false->true) raises the banner non-quiet.
+    let so = js.find("function setOnline(").expect("setOnline exists");
+    let so_end = js[so..].find("\n}\n").map(|k| so + k).unwrap_or(js.len());
+    assert!(
+        js[so..so_end].contains("runSyncBanner(false)"),
+        "reconnect must raise the sync banner non-quiet so the checklist is visible"
+    );
+    // A multi-item batch shows even from a quiet caller. Uncertain sends are
+    // not counted toward the two (AMUX-4594): they stay in the replay list so
+    // they keep being re-checked, and counting them popped the checklist on
+    // every new send (Ethan, 2026-09-14: "this shouldn't be appearing when I
+    // send, too invasive").
+    assert!(
+        js.contains("const show = !quiet || items.filter(i => !(i.type === 'queue' && _outboxUncertainMessage(i.item))).length >= 2;"),
+        "a 2+ item batch of non-uncertain items must show the checklist even when the caller is quiet"
+    );
+    // The per-item checkmark states must still exist.
+    assert!(
+        js.contains("i.status === 'done'") && js.contains("&#x2714;"),
+        "the checklist must mark each item done with a checkmark as it syncs"
+    );
+}
+
+/// The worker-LIST card composer has no "Attach file" button (Ethan,
+/// 2026-09-12: "remove the attach file button we don't need that from worker
+/// list page"). Attaching on a card still works by drag-and-drop and paste; the
+/// standalone 📎 button was the redundant surface. The peek composer keeps its
+/// own attach affordance — this guard is scoped to the card picker class.
+#[test]
+fn the_worker_list_card_has_no_attach_file_button() {
+    let js = asset("app.js");
+    assert!(
+        !js.contains("card-file-picker"),
+        "the card composer's standalone Attach-file button is back; Ethan removed it \
+         (drag-and-drop + paste still attach)"
+    );
+}
+
+/// The settings menu must ESCAPE the sticky .header-row (position:sticky;
+/// z-index:40) on mobile, or its absolutely-positioned dropdown paints behind
+/// #session-view and is invisible (Ethan, 2026-09-12: "when I press the
+/// settings button on mobile I don't see anything"). Only leaving that stacking
+/// context (position:fixed) works; raising z-index does not. Pin the mobile
+/// fixed override so a later refactor cannot silently re-trap it.
+#[test]
+fn the_mobile_settings_menu_escapes_the_sticky_header() {
+    let css = asset("app.css");
+    // Locate the actual selector and declarations. A character budget after
+    // a prose marker failed as soon as the rationale exceeded that budget.
+    let rule = regex::Regex::new(r"(?s)@media\s*\(max-width:\s*600px\)\s*\{\s*\.settings-menu\s*\{([^}]+)").unwrap();
+    let captures = rule.captures(&css).expect("the mobile settings-menu rule must be present");
+    let block = &captures[1];
+    assert!(
+        block.contains("position: fixed"),
+        "the mobile settings-menu override must use position:fixed to leave the header stacking context"
+    );
+}
+
+/// AMUX-4475: the interaction-feedback "Actions/Confirmed" hub (state/feedback.mjs
+/// appends it to .header-row) orphaned itself at the header's right edge and left
+/// the toolbar crammed in the corner. Ethan, 2026-09-12: "get rid of this and make
+/// the toolbar use the real estate we have." It is hidden in CSS (feedback still
+/// surfaces via toasts); pin that so a refactor cannot silently restore the clutter.
+#[test]
+fn the_interaction_feedback_hub_is_hidden_from_the_header() {
+    let css = asset("app.css");
+    let rule = regex::Regex::new(r"#interaction-feedback\s*\{[^}]*display:\s*none")
+        .unwrap();
+    assert!(
+        rule.is_match(&css),
+        "the interaction-feedback hub must be hidden (#interaction-feedback{{display:none}}) \
+         so it stops orphaning the header toolbar (AMUX-4475)"
+    );
+}
+
+/// AMUX-4475 "weird blue highlighting": .tab-bar is overflow-x:auto, which per the
+/// overflow spec forces overflow-y:auto, so a focused tab's focus ring gets its top
+/// and bottom clipped by the scroll box — leaving two stray blue vertical bars. The
+/// fix insets the ring (negative outline-offset) so it draws as a clean box and is
+/// never clipped. Pin the negative offset on the tab focus-visible rule.
+#[test]
+fn the_tab_focus_ring_is_inset_so_it_is_not_clipped_into_blue_bars() {
+    let css = asset("app.css");
+    let rule = regex::Regex::new(
+        r"(?s)\.tab-bar\s+button:focus-visible\s*\{([^}]*)\}",
+    )
+    .unwrap();
+    let block = rule
+        .captures(&css)
+        .expect("a .tab-bar button:focus-visible rule must exist (AMUX-4475)");
+    let decls = &block[1];
+    let off = regex::Regex::new(r"outline-offset:\s*(-?\d+)")
+        .unwrap()
+        .captures(decls)
+        .and_then(|c| c[1].parse::<i32>().ok())
+        .expect("the focus-visible rule must set outline-offset");
+    assert!(
+        off < 0,
+        "the tab focus ring must be INSET (negative outline-offset) so overflow-y:auto \
+         cannot clip it into stray blue vertical bars (AMUX-4475); got {off}"
+    );
+}
+
+/// AMUX-4476: clicking into a worker's Messages was slow because the surfaces
+/// fetched a 200-row first page, and /api/history is 12-120s under this host's
+/// read-pool contention (the wall-clock scales with row count). A small first
+/// page paints fast; "Load older" pages the rest. Pin the first-page ceiling so a
+/// later edit cannot quietly restore the 200-row wait.
+#[test]
+fn the_message_tabs_load_a_small_first_page() {
+    let js = asset("app.js");
+    for name in ["_PEEK_MSG_PAGE", "_MSGS_PAGE"] {
+        let re = regex::Regex::new(&format!(r"const\s+{name}\s*=\s*(\d+)")).unwrap();
+        let n = re
+            .captures(&js)
+            .and_then(|c| c[1].parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("{name} constant must exist (AMUX-4476)"));
+        assert!(
+            n <= 100,
+            "{name} is {n}; the message first page must stay small (<=100) so click-to-display \
+             is fast under read-pool contention (AMUX-4476)"
+        );
+    }
+}
+
+/// AMUX-4475: the toolbar controls must read as one consistent bordered set
+/// (Ethan, 2026-09-12: "borders around buttons too", "make the components all
+/// consistent", flat emoji throughout). The AF-750 header refinement had made
+/// the icon/count buttons borderless (border-color:transparent). Pin the boxed
+/// styling back so a later refactor cannot silently flatten them again.
+#[test]
+fn the_toolbar_buttons_are_boxed_not_borderless() {
+    let css = asset("app.css");
+    // The header override must NOT strip the border to transparent.
+    assert!(
+        !css.contains("border-color:transparent; background:transparent"),
+        "the header buttons are borderless again (border-color:transparent) — Ethan asked \
+         for borders around the toolbar buttons (AMUX-4475)"
+    );
+    // notif bell must carry a real border in the header.
+    let notif = regex::Regex::new(r"\.header-row #notif-btn \{[^}]*\}")
+        .unwrap()
+        .find(&css)
+        .map(|m| m.as_str().to_string())
+        .expect(".header-row #notif-btn rule must exist");
+    assert!(
+        notif.contains("border:1px solid var(--border)"),
+        "the notification bell must be a bordered box in the toolbar (AMUX-4475); got: {notif}"
+    );
+    // active + settings must be bordered boxes too.
+    let box_rule = regex::Regex::new(
+        r"\.header-row \.btn-active, \.header-row \.settings-btn \{[^}]*\}",
+    )
+    .unwrap()
+    .find(&css)
+    .map(|m| m.as_str().to_string())
+    .expect(".header-row .btn-active, .settings-btn rule must exist");
+    assert!(
+        box_rule.contains("border:1px solid var(--border)"),
+        "the active/settings toolbar buttons must be bordered boxes (AMUX-4475); got: {box_rule}"
+    );
+}
+
+/// AMUX-4475: flat emoji throughout the toolbar (Ethan's choice). The settings
+/// gear was a monochrome text glyph (U+2699) while the bell was a colour emoji;
+/// the gear now carries VARIATION SELECTOR-16 (U+FE0F) so it renders as an emoji
+/// to match. Also: the bell button must not re-add an inline border:none that
+/// would beat the stylesheet box.
+#[test]
+fn the_toolbar_icons_render_as_consistent_emoji() {
+    let html = asset("index.html");
+    let gear = regex::Regex::new(r#"id="settings-btn"[^>]*>([^<]*)</button>"#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("settings-btn must exist");
+    assert!(
+        gear.contains("&#x2699;&#xFE0F;") || gear.contains('\u{2699}'),
+        "the settings gear must render as an emoji (U+2699 + VS16) to match the bell (AMUX-4475); got: {gear:?}"
+    );
+    let notif = regex::Regex::new(r#"id="notif-btn"[^>]*style="([^"]*)""#)
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].to_string())
+        .expect("notif-btn must exist");
+    assert!(
+        !notif.contains("border:none"),
+        "the bell must not carry an inline border:none — it beats the toolbar box border (AMUX-4475); got: {notif}"
+    );
+}
+
+/// AMUX-4477: the MDAI viewer built a file's absolute path by joining the list
+/// path onto _AMUX_HOME ($HOME). But the list returns paths relative to the
+/// `.mdai` SCAN ROOT, which a `mdai_root` pref can move into a sub-vault (e.g.
+/// ~/.amux/local). There, joining onto $HOME produced /Users/x/Foo.mdai for a
+/// file at /Users/x/.amux/local/Foo.mdai, so EVERY open hit "no such path". The
+/// fix serves the real root as window._AMUX_MDAI_ROOT and _mdaiAbs prefers it.
+/// Pin both halves so a refactor cannot silently reintroduce the $HOME-only join.
+#[test]
+fn the_mdai_viewer_resolves_paths_against_the_scan_root() {
+    let js = asset("app.js");
+    let abs = regex::Regex::new(r"(?s)function _mdaiAbs\([^)]*\)\s*\{(.*?)\n\}")
+        .unwrap()
+        .captures(&js)
+        .map(|c| c[1].to_string())
+        .expect("_mdaiAbs must exist");
+    assert!(
+        abs.contains("_AMUX_MDAI_ROOT"),
+        "_mdaiAbs must join list paths onto _AMUX_MDAI_ROOT (the scan root), not just \
+         _AMUX_HOME, or every open under a mdai_root sub-vault hits 'no such path' (AMUX-4477)"
     );
 }

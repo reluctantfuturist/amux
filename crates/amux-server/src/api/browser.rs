@@ -74,8 +74,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
+mod ios;
+
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .nest("/ios", ios::routes())
         .route("/start", post(start))
         .route("/status", get(status))
         .route("/stop", post(stop))
@@ -88,6 +91,7 @@ pub fn routes() -> Router<AppState> {
         .route("/screenshot", get(screenshot))
         .route("/screenshot/file", get(screenshot_file))
         .route("/state", get(state_verb))
+        .route("/keepalive", post(keepalive))
         .route("/action", post(action))
         .route("/inspect", get(inspect))
         .route("/inspect/clear", post(inspect_clear))
@@ -1111,6 +1115,8 @@ struct StartBody {
     height: Option<u32>,
     /// AMUX-3508: launch with no window (`--headless=new`), same profile
     /// dirs — log in headfully once, reuse the cookies headlessly forever.
+    /// Omission defaults to headless so automation cannot steal desktop focus;
+    /// an explicit false requests a headed (normally minimized) browser.
     #[serde(default)]
     headless: Option<bool>,
     /// Explicit consent to replace ANOTHER session's running browser
@@ -1272,12 +1278,13 @@ async fn start(
             );
         }
     }
-    match chrome::start(&home, &body.profile, &body.url, &session, attrib.as_deref().unwrap_or(""), body.headless.unwrap_or(false))
+    match chrome::start(&home, &body.profile, &body.url, &session, attrib.as_deref().unwrap_or(""), body.headless.unwrap_or(true))
         .await
     {
         Ok(info) => {
             let mut v = serde_json::to_value(&info).unwrap_or_else(|_| json!({}));
             v["ok"] = json!(true);
+            v["headless"] = json!(body.headless.unwrap_or(true));
             // Apply the requested viewport to the tab start just opened —
             // same CDP call as the viewport action. A failure here degrades
             // the FIELD (`viewport_error`), never the start: the browser is
@@ -1314,7 +1321,7 @@ async fn start(
             // off the owner's screen a beat after it appears. Off with
             // AMUX_BROWSER_START_MINIMIZED=0. The pointer notes it so a caller
             // that wants the window can raise it with `amux browser identify`.
-            let headless = body.headless.unwrap_or(false);
+            let headless = body.headless.unwrap_or(true);
             let minimized = !headless && chrome::start_minimized_by_default();
             if let Some(p) = headed_launch_pointer(headless, minimized, &body.profile) {
                 v["tell_the_human"] = json!(p);
@@ -1338,7 +1345,7 @@ async fn start(
                     "profile": body.profile,
                     "requested_url": audit_url(&body.url),
                     "url": v.get("launch_url").and_then(Value::as_str).map(audit_url),
-                    "headless": body.headless.unwrap_or(false),
+                    "headless": body.headless.unwrap_or(true),
                     "pid": v.get("pid"),
                     "cdp_port": v.get("cdp_port"),
                 }),
@@ -1374,6 +1381,11 @@ fn start_status(e: &anyhow::Error) -> StatusCode {
         || e.downcast_ref::<chrome::ExternalProfileInUse>().is_some()
     {
         StatusCode::CONFLICT
+    } else if e.downcast_ref::<chrome::ProfileMissing>().is_some() {
+        // AMUX-4638: the request named a profile that does not exist. The
+        // caller fixes that by changing the request, so it is a 404, and a 5xx
+        // here sent a typo to every error sweep as a broken browser.
+        StatusCode::NOT_FOUND
     } else {
         StatusCode::BAD_GATEWAY
     }
@@ -1607,6 +1619,10 @@ mod headed_pointer_tests {
     /// confident instruction to look at nothing.
     #[test]
     fn a_headless_start_is_told_nothing_because_there_is_no_window() {
+        let omitted: StartBody = serde_json::from_str("{}").unwrap();
+        assert!(omitted.headless.unwrap_or(true));
+        let headed: StartBody = serde_json::from_str(r#"{"headless":false}"#).unwrap();
+        assert!(!headed.headless.unwrap_or(true));
         assert_eq!(headed_launch_pointer(true, false, "hubspot"), None);
     }
 }
@@ -1877,6 +1893,42 @@ async fn identify(headers: HeaderMap, body: Option<Json<IdentifyBody>>) -> Respo
     .into_response()
 }
 
+/// Which running browser a `/stop` request names (MHC-816).
+///
+/// Returns `(profile, started_by, pid)`, or None when the request does not
+/// resolve to exactly one — in which case the caller must stop NOTHING.
+///
+/// A pure function over the registry snapshot so the selection can be tested
+/// without killing a process: the defect was entirely in the selection, and a
+/// test that had to spawn browsers to reach it would never have been written.
+///
+/// Order is most-specific first. `session` resolves only when that lane owns
+/// exactly ONE browser; two browsers on one lane is the ambiguity this bug fed
+/// on, so it is left unresolved rather than settled by picking either.
+fn resolve_stop_target(
+    running: &[(String, String, i64, u32, u16, i64)],
+    want_profile: Option<&str>,
+    want_pid: Option<u32>,
+    want_session: Option<&str>,
+) -> Option<(String, String, u32)> {
+    let hit = running
+        .iter()
+        .find(|(p, _, _, _, _, _)| want_profile.is_some() && Some(p.as_str()) == want_profile)
+        .or_else(|| running.iter().find(|(_, _, _, pid, _, _)| want_pid.is_some() && Some(*pid) == want_pid))
+        .or_else(|| {
+            let mut owned = running
+                .iter()
+                .filter(|(_, by, _, _, _, _)| want_session.is_some() && Some(by.as_str()) == want_session);
+            match (owned.next(), owned.next()) {
+                (Some(one), None) => Some(one),
+                _ => None,
+            }
+        })
+        // A bare stop is unambiguous only when there is exactly one browser.
+        .or_else(|| if running.len() == 1 { running.first() } else { None })?;
+    Some((hit.0.clone(), hit.1.clone(), hit.3))
+}
+
 async fn stop(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1889,20 +1941,73 @@ async fn stop(
     let attrib = explicit_session(body.get("session").and_then(Value::as_str), &headers);
     let actor = attrib.as_deref().unwrap_or("(unattributed)");
     let home = chrome::amux_home();
+    // RESOLVE THE TARGET FROM THE REQUEST (MHC-816).
+    //
+    // This handler used to read `running_all().into_iter().next()` purely to
+    // LABEL the response, then call `stop_as`, which stops the OLDEST browser.
+    // `running_all` is sorted NEWEST first. So the label and the kill were
+    // sorted in opposite directions and, with more than one browser running,
+    // were guaranteed to name different ones. The body's `pid`, `profile` and
+    // `session` were never read at all.
+    //
+    // mixpeek-homepage-claude measured it twice on 2026-09-14: it stopped
+    // another lane's browser while the caller's stayed alive, and the second
+    // time the body named the caller's own pid and profile and it still killed
+    // the other one. Victims were tubescience and ai-for-smbs.
+    //
+    // `stop_as`'s own doc says "The API layer always names one; this arm exists
+    // for internal callers and tests". That was not true of this caller, which
+    // is why the fallback arm was doing the fleet's stopping.
+    let running = chrome::running_all();
+    let want_profile = body.get("profile").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let want_pid = body.get("pid").and_then(Value::as_u64).map(|p| p as u32);
+    let want_session = body.get("session").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let target = resolve_stop_target(&running, want_profile, want_pid, want_session);
+
+    let Some((profile, owner_of_target, target_pid)) = target else {
+        // NOTHING IS STOPPED HERE, deliberately. Guessing is what killed two
+        // lanes' browsers; an unresolvable stop names the candidates and lets
+        // the caller say which. A bare stop with exactly one browser running is
+        // still unambiguous and handled above.
+        let candidates: Vec<Value> = running
+            .iter()
+            .map(|(p, by, _, pid, _, _)| json!({"profile": p, "started_by": by, "pid": pid}))
+            .collect();
+        tracing::warn!(
+            stopped_by = %actor, n_running = running.len(),
+            measured = true, n_considered = running.len(),
+            verdict = "browser_stop_target_unresolved",
+            "browser: stop names no resolvable target; stopping nothing (MHC-816)"
+        );
+        return err(
+            StatusCode::CONFLICT,
+            json!({
+                "ok": false,
+                "error": if running.is_empty() { "no browser is running" }
+                         else { "several browsers are running and the request names none of them" },
+                "code": "browser_stop_target_unresolved",
+                "stopped": false,
+                "candidates": candidates,
+                "how_to_fix": "name one: {\"profile\": \"<profile>\"} or {\"pid\": <pid>}",
+            }),
+        );
+    };
+
     // Cross-session stop stays PERMITTED (a wedged browser must be cleanable
     // by whoever notices) but LOUD: the log and the response both name owner
     // and actor, so an anonymous stop can no longer read as a mystery death
-    // (AMUX-3063's other half — the 09:05 stop had no actor on record).
-    let owner = chrome::running_all().into_iter().next().map(|(_, o, _, _, _, _)| o);
+    // (AMUX-3063's other half — the 09:05 stop had no actor on record). The
+    // owner named here is now the owner of the browser actually being stopped.
+    let owner = Some(owner_of_target);
     if let Some(o) = owner.as_deref() {
         if attrib.as_deref() != Some(o) {
             tracing::warn!(
-                stopped_by = %actor, owner = %o,
+                stopped_by = %actor, owner = %o, profile = %profile, pid = target_pid,
                 "browser: cross-session STOP of another session's browser"
             );
         }
     }
-    let report = chrome::stop_as(&home, attrib.as_deref().unwrap_or("")).await;
+    let report = chrome::stop_profile_as(&home, &profile, attrib.as_deref().unwrap_or("")).await;
     let mut v = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
     v["ok"] = json!(true);
     v["stopped_by"] = json!(actor);
@@ -2626,6 +2731,73 @@ async fn state_payload(cdp: &mut chrome::CdpClient, session: &str) -> Result<Val
     Ok(v)
 }
 
+/// POST /api/browser/keepalive: "I am driving this over raw CDP" (AMUX-4685).
+///
+/// The activity arm reaps a profile with no amux verb for
+/// `AMUX_BROWSER_ACTIVITY_REAP_S` (300 by default). A session driving the same
+/// tab over raw CDP, which is what `/chrome-cdp` and
+/// `skills/chrome-cdp/scripts/cdp.mjs` do, sends no verb, so a browser under
+/// continuous use reads as idle and is closed. Measured 2026-09-15: three kills
+/// while driving dashboard overlays for AMUX-4684, one mid-sweep with results
+/// half-collected.
+///
+/// THE REAPER CANNOT LEARN THIS BY LOOKING. The card's first proposal was to
+/// poll the profile's own cdp_port, and it does not work: Chrome's HTTP
+/// endpoints expose no attachment state. Verified on an isolated headless
+/// Chrome with a debugger attached AND executing `Runtime.evaluate`, `/json/list`
+/// still reports `webSocketDebuggerUrl` on the driven target and `/json/version`
+/// carries version strings only. Identical output attached and detached, so no
+/// polling interval would help.
+///
+/// So the driver has to say so, and this is the cheapest thing it can say. It
+/// touches the same `last_verb` the activity arm reads and answers with the
+/// seconds remaining, so a caller can see the window rather than guess it.
+///
+/// `cdp.mjs` sends this on EVERY command, best-effort. A keepalive a caller must
+/// remember is opt-in, and the population that needs it is every CDP driver
+/// (ethos rule 1). Nobody should have to know this route exists.
+async fn keepalive(headers: HeaderMap, Query(q): Query<SessionQuery>) -> Response {
+    let session = resolve_session(q.session.as_deref(), &headers);
+    crate::integrations::browser::touch_verb_for_session(&session);
+    // REPORT WHAT WAS ACTUALLY TOUCHED, never just "ok". `touch_verb_for_session`
+    // prefers the browser this session owns and falls back to the only running
+    // one; a bare 200 cannot tell "your browser is now safe" from "you have no
+    // browser and nothing happened", and those need different actions from the
+    // caller.
+    let window = crate::runtime_jobs::browser_reaper::activity_reap_s();
+    let now = crate::integrations::browser::now_secs_i64();
+    let touched: Vec<Value> = crate::integrations::browser::running_all()
+        .into_iter()
+        .filter(|(_, owner, _, _, _, last_verb)| {
+            (owner == &session || session.is_empty()) && now - last_verb <= 2
+        })
+        .map(|(profile, owner, _, _, _, last_verb)| {
+            json!({
+                "profile": profile,
+                "started_by": owner,
+                "seconds_since_verb": now - last_verb,
+                "reaped_in_s": if window == 0 { Value::Null } else { json!(window as i64 - (now - last_verb)) },
+            })
+        })
+        .collect();
+    Json(json!({
+        "ok": true,
+        "session": session,
+        "measured": true,
+        "n_considered": crate::integrations::browser::running_all().len(),
+        "touched": touched,
+        "activity_window_s": if window == 0 { Value::Null } else { json!(window) },
+        "note": if window == 0 {
+            "the activity arm is disabled (AMUX_BROWSER_ACTIVITY_REAP_S=0), so nothing reaps on inactivity"
+        } else if touched.is_empty() {
+            "NO BROWSER WAS TOUCHED: this session owns none and there is not exactly one running"
+        } else {
+            "the activity reaper's clock is reset for the browser(s) named above"
+        },
+    }))
+    .into_response()
+}
+
 async fn state_verb(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2667,6 +2839,40 @@ const VIEWPORT_DEVICES: &[(&str, u32, u32)] = &[
     ("ipad", 820, 1180),
     ("desktop", 1280, 900),
 ];
+
+// Keep the file schema independent of CDP: positive schema controls must not
+// attach their fixture to whichever real browser happens to be running.
+fn validate_file_action(body: &Value) -> Result<(), String> {
+    if body.get("selector").and_then(Value::as_str).map(str::trim).unwrap_or("").is_empty() {
+        return Err("files needs a selector for the <input type=file>".into());
+    }
+    let paths = body.get("files").and_then(Value::as_array);
+    let Some(paths) = paths.filter(|a| !a.is_empty()) else {
+        return Err("files needs a non-empty `files` array of absolute paths".into());
+    };
+    for p in paths {
+        let Some(p) = p.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+            return Err("every entry in `files` must be a non-empty string path".into());
+        };
+        // CDP resolves relative paths against the browser's working directory.
+        if !std::path::Path::new(p).is_absolute() {
+            return Err(format!(
+                "file path must be absolute, got {p:?} — CDP resolves a relative \
+                 path against the browser's working directory, not yours, so it \
+                 would silently attach the wrong file"
+            ));
+        }
+        // CDP reports success even when the path has no bytes to attach.
+        if !std::path::Path::new(p).exists() {
+            return Err(format!(
+                "no such file: {p:?} (resolved on the machine running Chrome). \
+                 setFileInputFiles reports success for a missing path, so this is \
+                 refused here rather than surfacing later as a broken upload"
+            ));
+        }
+    }
+    Ok(())
+}
 
 async fn action(
     State(state): State<AppState>,
@@ -2742,59 +2948,11 @@ async fn action(
                 return err(StatusCode::BAD_REQUEST, json!({ "error": "wait needs selector or text" }));
             }
         }
-        // TUBES-2343. Validated here with the rest, so a bad request is a 400
-        // whether or not a browser happens to be running and the schema stays
-        // testable without Chrome.
         "files" => {
-            if get_str("selector").map(|s| s.trim().is_empty()).unwrap_or(true) {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    json!({ "error": "files needs a selector for the <input type=file>" }),
-                );
-            }
-            let paths = body.get("files").and_then(Value::as_array);
-            let Some(paths) = paths.filter(|a| !a.is_empty()) else {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    json!({ "error": "files needs a non-empty `files` array of absolute paths" }),
-                );
-            };
-            for p in paths {
-                let Some(p) = p.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        json!({ "error": "every entry in `files` must be a non-empty string path" }),
-                    );
-                };
-                // ABSOLUTE ONLY. CDP resolves a relative path against the
-                // BROWSER's working directory, not the caller's, so a relative
-                // path does not fail — it attaches the wrong file or nothing,
-                // and the upload under test then "passes" against a file the
-                // author never chose.
-                if !std::path::Path::new(p).is_absolute() {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        json!({ "error": format!(
-                            "file path must be absolute, got {p:?} — CDP resolves a relative \
-                             path against the browser's working directory, not yours, so it \
-                             would silently attach the wrong file"
-                        ) }),
-                    );
-                }
-                // EXISTENCE, checked before the round trip. `DOM.setFileInputFiles`
-                // accepts a missing path and reports success; the page then sees
-                // an input with a file that has no bytes, which reads as a broken
-                // upload rather than as a bad request.
-                if !std::path::Path::new(p).exists() {
-                    return err(
-                        StatusCode::BAD_REQUEST,
-                        json!({ "error": format!(
-                            "no such file: {p:?} (resolved on the machine running Chrome). \
-                             setFileInputFiles reports success for a missing path, so this is \
-                             refused here rather than surfacing later as a broken upload"
-                        ) }),
-                    );
-                }
+            if let Err(error) = validate_file_action(&body) {
+                tracing::warn!(verdict = "browser_files_schema_rejected", measured = true,
+                    n_considered = 1, "{error}");
+                return err(StatusCode::BAD_REQUEST, json!({ "error": error }));
             }
         }
         "type" | "scroll" | "back" | "extract" => {}
@@ -3492,10 +3650,13 @@ fn catalog_body(path: &str) -> Response {
                 "GET /api/browser/status", "GET /api/browser/state", "GET /api/browser/screenshot",
                 "GET /api/browser/profiles", "GET /api/browser/pw-profiles", "GET /api/browser/sessions",
                 "GET /api/browser/history (durable redacted action trail)",
+                "GET /api/browser/ios/targets (local iOS Simulator runtime/device inventory)",
+                "POST /api/browser/ios/start (session, udid, url); /ios/{status,state,screenshot,action,stop} (explicit session required)",
                 "GET /api/browser/inspect", "GET /api/browser/search",
                 "POST /api/browser/start (profile, url, session; viewport at launch via device or width+height)",
                 "POST /api/browser/navigate", "POST /api/browser/action",
                 "POST /api/browser/stop", "POST /api/browser/inspect/clear",
+                "POST /api/browser/keepalive (I am driving this over raw CDP; resets the activity reaper)",
                 "POST /api/browser/save-profile", "POST /api/browser/profile/create",
                 "DELETE /api/browser/profile/{name}",
                 "POST /api/browser/agent (answers 501 — the session's model drives the native verbs)",
@@ -3520,6 +3681,75 @@ fn catalog_body(path: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    /// MHC-816, reported by mixpeek-homepage-claude with two measured incidents
+    /// on 2026-09-14: `/api/browser/stop` killed another lane's browser while
+    /// the caller's stayed alive, and the second time the body named the
+    /// caller's OWN pid and profile and it still killed the other one.
+    ///
+    /// The mechanism: the handler labelled the response from
+    /// `running_all().into_iter().next()` (sorted NEWEST first) and then called
+    /// `stop_as`, which stops the OLDEST. Two orderings in opposite directions,
+    /// so with more than one browser running they could not agree. The body's
+    /// pid/profile/session reached neither.
+    ///
+    /// The fixture is two browsers on two lanes, which is the smallest shape
+    /// that can expose it — with one running, every wrong policy looks right.
+    #[test]
+    fn a_stop_targets_the_browser_the_request_names_and_refuses_to_guess() {
+        // (profile, started_by, started_at, pid, cdp_port, last_verb_at).
+        // beta is NEWER than alpha, so "newest" and "oldest" disagree here.
+        let running = vec![
+            ("alpha".to_string(), "tubescience".to_string(), 100i64, 111u32, 9001u16, 0i64),
+            ("beta".to_string(), "mixpeek-homepage-claude".to_string(), 200i64, 222u32, 9002u16, 0i64),
+        ];
+
+        // BY PROFILE: the caller's own, not the other lane's.
+        let got = super::resolve_stop_target(&running, Some("beta"), None, None);
+        assert_eq!(got, Some(("beta".into(), "mixpeek-homepage-claude".into(), 222)),
+            "a named profile must select that browser");
+
+        // BY PID: the exact failure reported — body named the caller's own pid.
+        let got = super::resolve_stop_target(&running, None, Some(222), None);
+        assert_eq!(got, Some(("beta".into(), "mixpeek-homepage-claude".into(), 222)),
+            "a named pid must select that browser, not the oldest");
+
+        // The other lane is still reachable ON PURPOSE: a wedged browser must
+        // be cleanable by whoever notices. What changed is that it happens only
+        // when asked for by name.
+        let got = super::resolve_stop_target(&running, Some("alpha"), None, None);
+        assert_eq!(got, Some(("alpha".into(), "tubescience".into(), 111)));
+
+        // BY SESSION, when that lane owns exactly one.
+        let got = super::resolve_stop_target(&running, None, None, Some("tubescience"));
+        assert_eq!(got, Some(("alpha".into(), "tubescience".into(), 111)));
+
+        // AMBIGUOUS: two running, nothing named. Stopping nothing is the whole
+        // fix; the old code stopped the oldest and told the caller it had
+        // stopped the newest's owner.
+        assert_eq!(super::resolve_stop_target(&running, None, None, None), None,
+            "a bare stop with two browsers running must resolve to nothing");
+
+        // AMBIGUOUS: one lane owns both. Picking either is what the bug did.
+        let two_on_one = vec![
+            ("alpha".to_string(), "same-lane".to_string(), 100i64, 111u32, 9001u16, 0i64),
+            ("beta".to_string(), "same-lane".to_string(), 200i64, 222u32, 9002u16, 0i64),
+        ];
+        assert_eq!(super::resolve_stop_target(&two_on_one, None, None, Some("same-lane")), None,
+            "a lane owning two browsers does not name one of them");
+
+        // A name that matches nothing resolves to nothing, rather than falling
+        // through to some other browser.
+        assert_eq!(super::resolve_stop_target(&running, Some("ghost"), None, None), None);
+        assert_eq!(super::resolve_stop_target(&running, None, Some(999), None), None);
+
+        // A BARE stop with exactly one running is still unambiguous.
+        let one = vec![("solo".to_string(), "lane".to_string(), 1i64, 7u32, 9000u16, 0i64)];
+        assert_eq!(super::resolve_stop_target(&one, None, None, None),
+            Some(("solo".into(), "lane".into(), 7)));
+        assert_eq!(super::resolve_stop_target(&[], None, None, None), None,
+            "nothing running resolves to nothing");
+    }
+
     use super::*;
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -3563,6 +3793,67 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v, proxied)
+    }
+
+    /// `/keepalive` resets the activity clock, and SAYS WHICH BROWSER (AMUX-4685).
+    ///
+    /// A bare 200 here would be the worst possible answer: the two states a
+    /// caller must tell apart are "your browser is safe for another N seconds"
+    /// and "you have no browser and nothing happened", and they need different
+    /// actions. `touch_verb_for_session` prefers the browser this session owns
+    /// and falls back to the only running one, so silence is genuinely ambiguous.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keepalive_resets_the_activity_clock_and_names_what_it_touched() {
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running("hubspot", "lane-a", 4242);
+        let app = app();
+
+        let (st, v, _) = send(&app, "POST", "/api/browser/keepalive?session=lane-a", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], json!(true), "{v}");
+        let touched = v["touched"].as_array().cloned().unwrap_or_default();
+        assert_eq!(touched.len(), 1, "it must name the browser it touched: {v}");
+        assert_eq!(touched[0]["profile"], json!("hubspot"), "{v}");
+        assert_eq!(touched[0]["started_by"], json!("lane-a"), "{v}");
+        // The seed stamps last_verb_at = 0, so a clock that did not move would
+        // report an age of ~now rather than ~0. This is the assertion that the
+        // route DID something.
+        let age = touched[0]["seconds_since_verb"].as_i64().unwrap_or(i64::MAX);
+        assert!(age <= 2, "the activity clock was not reset: age {age} in {v}");
+        assert!(v["n_considered"].as_u64().unwrap_or(0) >= 1, "{v}");
+
+        // A LANE WITH NO BROWSER MUST NOT READ AS PROTECTED. Two running
+        // browsers defeat the single-browser fallback, so this session owns
+        // neither and nothing should be claimed.
+        crate::integrations::browser::test_clear_running();
+        crate::integrations::browser::test_seed_running_port("a", "lane-a", 1, 1);
+        crate::integrations::browser::test_seed_running_port("b", "lane-b", 2, 2);
+        let (st, v, _) = send(&app, "POST", "/api/browser/keepalive?session=lane-z", None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            v["touched"].as_array().is_none_or(|t| t.is_empty()),
+            "lane-z owns no browser and there is not exactly one: {v}"
+        );
+        assert!(
+            v["note"].as_str().unwrap_or_default().contains("NO BROWSER WAS TOUCHED"),
+            "the answer must say nothing happened: {v}"
+        );
+        crate::integrations::browser::test_clear_running();
+    }
+
+    /// The route is in the catalog. An unknown /api/browser path answers with the
+    /// route list, and that list is the only place a caller who is not reading
+    /// source finds out this exists. A verb nobody can name is a verb nobody has.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_catalog_names_the_keepalive_verb() {
+        let app = app();
+        let (st, v, _) = send(&app, "GET", "/api/browser/definitely-not-a-route", None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+        let routes = v["routes"].as_array().cloned().unwrap_or_default();
+        assert!(
+            routes.iter().any(|r| r.as_str().unwrap_or_default().contains("/api/browser/keepalive")),
+            "the catalog must name it: {v}"
+        );
     }
 
     #[test]
@@ -3980,6 +4271,34 @@ mod tests {
         let error = body["error"].as_str().unwrap();
         assert!(error.contains("every retry would open another tab"), "{error}");
         assert!(error.contains("Do not retry"), "{error}");
+    }
+
+    /// AMUX-4638: a named profile with no source directory is 404. Built
+    /// through the real import function rather than a hand-made value, so a
+    /// construction site that stops producing `ProfileMissing` fails here too,
+    /// the seam `exit_zero_before_cdp...` closes for delegation.
+    #[test]
+    fn a_missing_named_profile_is_404_and_keeps_its_message() {
+        let home = tempfile::tempdir().unwrap();
+        let chrome_dir = home.path().join("chrome-udd");
+        std::fs::create_dir_all(&chrome_dir).unwrap();
+        let missing =
+            chrome::import_chrome_profile(home.path(), &chrome_dir, "no-such-profile").unwrap_err();
+        assert_eq!(start_status(&missing), StatusCode::NOT_FOUND);
+        let message = missing.to_string();
+        assert!(message.starts_with("Chrome profile \"no-such-profile\" does not exist at "), "{message}");
+        assert!(
+            message.ends_with("; create an amux profile with POST /api/browser/profile/create instead"),
+            "{message}"
+        );
+        let wrapped = chrome::import_chrome_profile(home.path(), &chrome_dir, "no-such-profile")
+            .unwrap_err()
+            .context("while starting the browser");
+        assert_eq!(start_status(&wrapped), StatusCode::NOT_FOUND);
+        // CONTROL: the decision is on the type. The same words in an untyped
+        // error stay 502, so rewording the message cannot change the status.
+        let untyped = anyhow::anyhow!("{message}");
+        assert_eq!(start_status(&untyped), StatusCode::BAD_GATEWAY);
     }
 
     /// The SEAM between "what Chrome did" and "which error type gets built".
@@ -4420,8 +4739,8 @@ mod tests {
         // SUCCESS, leaving the page with an input whose file has no bytes — so
         // the fault surfaces later, inside whatever upload was under test,
         // wearing the shape of a product bug. Refused here instead.
-        let missing = std::env::temp_dir().join("tubes-2343-does-not-exist.png");
-        let _ = std::fs::remove_file(&missing);
+        let fixtures = tempfile::tempdir().expect("fixture directory");
+        let missing = fixtures.path().join("missing.png");
         let body = format!(
             r##"{{"action":"files","selector":"#f","files":[{}]}}"##,
             json!(missing.to_string_lossy())
@@ -4430,19 +4749,14 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
         assert!(v["error"].as_str().unwrap_or("").contains("no such file"), "{v}");
 
-        // CONTROL: an existing absolute path passes the SCHEMA and is refused
-        // only for want of a browser. Without this cell the assertions above
-        // would all pass against a handler that rejected every `files` request,
-        // which is a working schema and a dead action.
-        let present = std::env::temp_dir().join("tubes-2343-present.png");
+        // CONTROL: exercise the handler's actual schema without connecting to
+        // a live browser. A valid request may legitimately receive a later 400
+        // for an absent selector; status alone cannot identify the failing layer.
+        let present = fixtures.path().join("present.png");
         std::fs::write(&present, b"x").expect("write fixture");
-        let body = format!(
-            r##"{{"action":"files","selector":"#f","files":[{}]}}"##,
-            json!(present.to_string_lossy())
-        );
-        let (status, v, _) = send(&app, "POST", "/api/browser/action", Some(&body)).await;
-        let _ = std::fs::remove_file(&present);
-        assert_ne!(status, StatusCode::BAD_REQUEST, "a valid files request must clear the schema: {v}");
+        let body = json!({"action":"files", "selector":"#f", "files":[present]});
+        assert_eq!(validate_file_action(&body), Ok(()),
+            "a valid files request must clear the schema without browser I/O");
 
         // AND THE ACTION IS DISCOVERABLE. An action the contract does not list
         // reaches nobody, which is the gap this card was filed about — the
