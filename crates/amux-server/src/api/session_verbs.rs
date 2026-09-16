@@ -6436,14 +6436,35 @@ fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
     }
 
     let (plain, dim) = dim_mask(raw);
-    let plain_squashed: String = plain.split_whitespace().collect();
-    let expected_plain: String = format!("{identity}{location}").split_whitespace().collect();
-    let dim_squashed: String = dim.split_whitespace().collect();
-    let expected_dim: String = std::iter::once("\u{b7}")
-        .chain(parts.iter().skip(2).flat_map(|part| ["\u{b7}", *part]))
-        .flat_map(str::split_whitespace)
-        .collect();
-    dim_squashed == expected_dim && plain_squashed == expected_plain
+    let squash = |s: &str| -> String { s.split_whitespace().collect() };
+    let plain_squashed = squash(&plain);
+    let dim_squashed = squash(&dim);
+    let head = squash(&format!("{identity}{location}"));
+    // Identity and location are painted plain; every separator is painted dim.
+    let Some(plain_tail) = plain_squashed.strip_prefix(head.as_str()) else { return false };
+    let separators = "\u{b7}".repeat(parts.len() - 1);
+    let Some(dim_tail) = dim_squashed.strip_prefix(separators.as_str()) else { return false };
+    // TRAILING SEGMENTS MAY BE PAINTED EITHER WAY. Codex dims a branch
+    // (`· Main [default]`) but paints a session name plain
+    // (`· reviewer-sol`, coloured, after a reset). The proof used to require
+    // every trailing segment dim, so a footer carrying a session name failed it
+    // and the whole line was read as typed input: measured 2026-09-16, every
+    // idle Codex lane on the fleet wore "unsubmitted text" with its own footer
+    // as the preview, and `possible_codex_footer_chrome` fired on each — the
+    // drift detector doing exactly its job. Each trailing part must appear
+    // whole in exactly one of the two masks, in order; nothing else may.
+    let trailing: Vec<String> = parts.iter().skip(2).map(|p| squash(p)).collect();
+    let (mut pt, mut dt) = (plain_tail, dim_tail);
+    for part in &trailing {
+        if let Some(rest) = pt.strip_prefix(part.as_str()) {
+            pt = rest;
+        } else if let Some(rest) = dt.strip_prefix(part.as_str()) {
+            dt = rest;
+        } else {
+            return false;
+        }
+    }
+    pt.is_empty() && dt.is_empty()
 }
 
 /// A broad diagnostic only: a path-bearing middle-dot row near the composer
@@ -29163,6 +29184,12 @@ mod composer_state_tests {
     /// Cross-provider/model control captured from mixpeek-ops-server on
     /// 2026-09-07. Footer classification is structural: an Astra identity and
     /// a different worktree must not require another model-name allowlist.
+    /// Codex 0.154, captured 2026-09-16 on an idle lane whose footer ends in a
+    /// SESSION NAME painted plain after a reset (`· reviewer-sol`), unlike the
+    /// dim branch segment in the fixtures above. Every idle Codex lane on that
+    /// fleet read "unsubmitted text" with this footer as the preview.
+    const LIVE_CODEX_IDLE_WITH_SESSION_NAME: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol medium\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/.amux/worktrees/obrist/reviewer-sol\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;156;222;211mreviewer-sol\u{1b}[39m\n";
+
     const LIVE_CODEX_ASTRA_IDLE_WITH_BRANCH: &str = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  \u{1b}[38;2;246;226;183mgpt-6-astra xhigh\u{1b}[2m\u{1b}[39m \u{b7} \u{1b}[0m\u{1b}[38;2;171;223;167m~/Dev/mixpeek/operations\u{1b}[2m\u{1b}[39m \u{b7} Main [default]\u{1b}[0m\n";
 
     /// `backend`, captured 2026-08-09 while it was being reported as "holding
@@ -29366,6 +29393,7 @@ mod composer_state_tests {
             LIVE_CODEX_IDLE,
             LIVE_CODEX_IDLE_WITH_BRANCH,
             LIVE_CODEX_ASTRA_IDLE_WITH_BRANCH,
+            LIVE_CODEX_IDLE_WITH_SESSION_NAME,
         ] {
             assert_eq!(
                 composer_state(frame),
@@ -29387,6 +29415,12 @@ mod composer_state_tests {
             "ship the current task",
         );
         assert_eq!(composer_state(&typed).typed(), Some("shipthecurrenttask"));
+        let typed = LIVE_CODEX_IDLE_WITH_SESSION_NAME.replace(
+            "\u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+            "ship the current task",
+        );
+        assert_eq!(composer_state(&typed).typed(), Some("shipthecurrenttask"),
+            "typed text must stay pending in the session-name footer shape too");
 
         // Observability control: path-bearing prose without Codex's raw style
         // proof stays typed, but is called out as possible footer drift by the
