@@ -853,6 +853,23 @@ pub struct FleetSignals {
     pub now: f64,
 }
 
+/// Does this lane's stored self-report currently APPLY — the same verdict
+/// [`report_applies`] gives the status badge? A report from a previous life, an
+/// `active` claim past its heartbeat, or an `idle` older than its trust window
+/// is evidence of nothing, and a lane holding one must be treated exactly like a
+/// lane that never reported: its pane stays admissible so its idle composer can
+/// still be recognised. Subsumes [`no_current_hook_report`], which only knew
+/// about existence and life.
+fn hook_report_applies(report: Option<&Value>, started: f64, now: f64) -> bool {
+    if no_current_hook_report(report, started) {
+        return false;
+    }
+    let Some(report) = report else { return false };
+    let state = report.get("state").and_then(Value::as_str).unwrap_or("");
+    let ts = report.get("ts").and_then(Value::as_f64).unwrap_or(0.0);
+    report_applies(state, ts, started, now)
+}
+
 fn no_current_hook_report(report: Option<&Value>, started: f64) -> bool {
     let ts=report.and_then(|r|r.get("ts")).and_then(Value::as_f64).unwrap_or(0.0);
     ts <= 0.0 || ts < started
@@ -1215,9 +1232,26 @@ impl FleetSignals {
                     .map(|signal| (name.to_string(), signal))
             })
             .collect();
+        // One clock for the staleness verdict below and the struct's own `now`, so the
+        // filter and every later reader judge the same instant.
+        let now = chrono::Utc::now().timestamp() as f64;
         let hookless_workers = running.iter().filter_map(|tmux| tmux.strip_prefix("amux-"))
             .filter(|name| {
-                let no_current_report = no_current_hook_report(reports.get(*name), started.get(*name).copied().unwrap_or(0.0));
+                // A REPORT THAT NO LONGER APPLIES IS THE SAME AS NO REPORT. This used
+                // to ask only whether a report EXISTED for this life
+                // (`no_current_hook_report`), so a Claude lane whose last Stop hook
+                // fired more than AMUX_HOOKS_LIVE_IDLE_S ago was neither hookless (it
+                // has a report) nor structured (`report_applies` refuses it) — and
+                // its pane had aged out of candidacy because an idle lane does not
+                // paint. Unmeasurable on every axis, precisely because it was idle.
+                // Measured on a live fleet, 2026-09-16: three Claude lanes idle at
+                // their composer held queued rows for 52-165 hours, each logging
+                // `idle_display_without_delivery_boundary ... measured=false`, until
+                // the no-signal escape delivered them an hour late. ONE predicate,
+                // the one the status badge already uses, decides both.
+                let no_current_report = !hook_report_applies(
+                    reports.get(*name), started.get(*name).copied().unwrap_or(0.0), now,
+                );
                 // A fresh Claude worker has no Stop hook yet. Its recognized idle
                 // composer must stay observable after its last repaint ages out.
                 no_current_report || crate::config::parse_env_file(&amux_home().join("sessions").join(format!("{name}.env")))
@@ -1238,7 +1272,7 @@ impl FleetSignals {
             provider_children_measured,
             panes: BTreeMap::new(),
             subagent_activity: scan_subagent_activity(),
-            now: chrono::Utc::now().timestamp() as f64,
+            now,
         }
     }
 
@@ -5664,6 +5698,43 @@ Claude usage limit reached. Your limit will reset at 3pm.
         s.panes.insert(lane.into(), String::new());
         assert!(s.turn_boundary_status(lane).is_none());
         s.panes.clear();
+        assert!(s.turn_boundary_status(lane).is_none());
+    }
+
+    /// THE LIVE INCIDENT (2026-09-16). worker-opus: Claude Code, idle at its
+    /// composer with an unsent draft, last Stop hook 165 hours ago, last repaint
+    /// long past the contradiction window. `report_applies` refused the report
+    /// (older than AMUX_HOOKS_LIVE_IDLE_S), `no_current_hook_report` said a
+    /// report existed, so the lane was neither structured nor hookless and its
+    /// pane was inadmissible: `turn_boundary_status` was None and a queued row
+    /// waited for the hour-long no-signal escape while the boundary sat on screen.
+    #[test]
+    fn an_aged_idle_report_does_not_make_a_quiet_composer_unmeasurable() {
+        let mut s = signals();
+        let lane = "worker-opus";
+        s.running.insert(format!("amux-{lane}"));
+        s.started.insert(lane.into(), s.now - 1_000_000.0);   // this life began long before the report
+        s.activity.insert(format!("amux-{lane}"), (s.now - 7200.0) as i64);
+        // Report from THIS life, idle, but older than the 24h idle trust window.
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - 165.0 * 3600.0, "source": "stop-hook"}});
+        let aged = s.reports[lane].clone();
+        assert!(!no_current_hook_report(Some(&aged), s.now - 1_000_000.0), "fixture: the report IS from this life");
+        assert!(!hook_report_applies(Some(&aged), s.now - 1_000_000.0, s.now), "the aged report must not apply");
+        assert!(hook_report_applies(Some(&json!({"state":"idle","ts": s.now - 50.0})), s.now - 100.0, s.now), "a fresh one does");
+        assert!(!hook_report_applies(Some(&json!({"state":"idle","ts": s.now - 50.0})), s.now - 10.0, s.now), "a previous-life one does not");
+        assert!(!hook_report_applies(None, s.now - 100.0, s.now));
+        // What load_scoped does with that verdict.
+        if !hook_report_applies(s.reports.get(lane), s.now - 1_000_000.0, s.now) { s.hookless_workers.insert(lane.into()); }
+        // The real frame, ANSI stripped: draft in the composer, auto-mode footer.
+        s.panes.insert(lane.into(), "\u{276f} mark #239 ready and route it back to Astra\n\
+────────────────────────────────────────\n\
+  \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} PR #239 \u{b7} \u{2190} for agents \u{b7} /diff to hide diff".into());
+        assert!(s.pane_probe_candidate(lane), "an aged report must not age the pane out of candidacy");
+        assert_eq!(s.turn_boundary_status(lane).as_deref(), Some("idle"), "the boundary is on screen");
+        // Silence never permits a send: a working bar or an empty capture still holds.
+        s.panes.insert(lane.into(), WORKING_BAR.into());
+        assert_ne!(s.turn_boundary_status(lane).as_deref(), Some("idle"));
+        s.panes.insert(lane.into(), String::new());
         assert!(s.turn_boundary_status(lane).is_none());
     }
 
