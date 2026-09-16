@@ -29691,6 +29691,24 @@ mod steer_freeze_tests {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod steer_max_age_tests {
+    use super::{detect_claude_status, pane_is_at_boundary};
+
+    /// Two real idle panes from a live fleet whose queues had waited 52-165 hours. Pane
+    /// recognition was NOT the gap: both are boundaries here. What was missing is that
+    /// the pane was never consulted, because the lane had aged out of candidacy
+    /// (sessions_legacy::an_aged_idle_report_does_not_make_a_quiet_composer_unmeasurable).
+    #[test]
+    fn a_real_idle_composer_is_a_turn_boundary_on_both_providers() {
+        let claude_draft = "\u{276f} mark #239 ready and route it back to Astra\n\
+            ────────────────────────────────────────\n\
+              \u{23f5}\u{23f5} auto mode on (shift+tab to cycle) \u{b7} PR #239 \u{b7} \u{2190} for agents \u{b7} /diff to hide diff\n";
+        assert_eq!(detect_claude_status(claude_draft), "idle");
+        assert!(pane_is_at_boundary(claude_draft), "an idle Claude composer holding a draft is a boundary");
+        let codex_idle = "\u{2022} Understood. The direct wake applies only to reviews I newly complete.\n\
+            \u{203a} Ask Codex to do anything\n\
+              gpt-6-astra high \u{b7} ~/.amux/worktrees/obrist/reviewer-astra\n";
+        assert!(pane_is_at_boundary(codex_idle), "an idle Codex composer is a boundary");
+    }
     use super::*;
 
     const MAX: f64 = 600.0;
