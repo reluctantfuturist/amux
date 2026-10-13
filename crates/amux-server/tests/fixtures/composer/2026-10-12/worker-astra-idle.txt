@@ -1,0 +1,16 @@
+source /Users/slopmachine/.zprofile 2>/dev/null; cd /Users/slopmachine/.amux/worktrees/obrist/worker-astra; cd /Users/slopmachine/.amux/worktrees/obrist/worker-astra; set -a; source /Users/slopmachine/.amux/sessions/work
+er-astra.env 2>/dev/null; set +a;
+slopmachine@Alexeys-Mini worker-astra % source /Users/slopmachine/.zprofile 2>/dev/null; cd /Users/slopmachine/.amux/worktrees/obrist/worker-astra; cd /Users/slopmachine/.amux/worktrees/obrist/worker-astra; set -a; sourc
+e /Users/slopmachine/.amux/sessions/worker-astra.env 2>/dev/null; set +a;
+slopmachine@Alexeys-Mini worker-astra % cd /Users/slopmachine/.amux/worktrees/obrist/worker-astra && codex --model gpt-6-astra -c model_reasoning_effort=high --add-dir '/Users/Shared/Epic Games/UE_5.8' --add-dir /Users/s
+lopmachine/Library -a never --sandbox workspace-write --add-dir /Users/slopmachine/.amux/logs --add-dir /Users/slopmachine/projects/obrist/.git
+
+  [38;2;99;168;248m>_ [1m[39mOpenAI Codex[0;2m (v0.162.1)[0m
+     [2m~/.amux/worktrees/obrist/worker-astra[0m
+
+  [1mTip:[0m Use the [1mdesktop app[0m. Run [38;2;166;227;161mcodex app[39m to open it. It installs automatically if needed.
+
+
+[1m›[0m [2mAsk Codex to do anything[0m
+
+  [38;2;246;226;183mGPT-6-Astra high[39m · [38;2;171;223;167m~/.amux/worktrees/obrist/worker-astra[39m                                                                                                                                         ⚠ [38;2;196;167;103m1 warning[39m · [1mf2[0m to view

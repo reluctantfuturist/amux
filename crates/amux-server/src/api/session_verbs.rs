@@ -7219,12 +7219,16 @@ pub fn is_collapsed_paste(pending: &str) -> bool {
 /// The current TUI draws no box rule between its composer and this footer, so
 /// the generic continuation scan cannot stop on geometry as it does for Claude
 /// Code. Match the footer's STRUCTURE and styling instead of any model/version:
-/// Codex dims only the middle-dot separator and leaves the model, effort, and
-/// working directory normally coloured. Requiring that raw ANSI evidence is
+/// older captures dim the middle-dot separators; newer captures reset the
+/// foreground between truecolor identity/path/session spans. Both proofs need
+/// raw ANSI evidence, including the styling of any warning/view hint. This is
 /// deliberate. If a future Codex release changes the chrome, this fails toward
 /// `Typed` (a visible, unconfirmed send) rather than hiding real user input and
 /// falsely claiming that it was submitted.
 fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
+    if codex_truecolor_footer_chrome(raw) {
+        return true;
+    }
     let text = stripped.trim();
     let parts: Vec<&str> = text.split('\u{b7}').map(str::trim).collect();
     if parts.len() < 2 || parts.iter().any(|part| part.is_empty()) {
@@ -7265,6 +7269,71 @@ fn codex_model_footer_chrome(raw: &str, stripped: &str) -> bool {
         }
     }
     pt.is_empty() && dt.is_empty()
+}
+
+/// Captured 2026-10-12: default-foreground separators, truecolor content,
+/// and an optional right-aligned warning WITHOUT a middle-dot before it.
+/// Accept only whole, explicitly reset spans and the captured trailing chrome;
+/// a plain continuation or an unknown tail must keep failing toward Typed.
+fn codex_truecolor_footer_chrome(raw: &str) -> bool {
+    fn span(raw: &str) -> Option<(&str, &str)> {
+        let (rgb, body) = raw.strip_prefix("\u{1b}[38;2;")?.split_once('m')?;
+        let mut channels = rgb.split(';');
+        for _ in 0..3 {
+            let channel = channels.next()?;
+            if channel.is_empty() || !channel.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            channel.parse::<u8>().ok()?;
+        }
+        if channels.next().is_some() {
+            return None;
+        }
+        let (text, rest) = body.split_once("\u{1b}[39m")?;
+        if text.trim().is_empty() || text.contains(['\u{1b}', '\u{b7}', '\n', '\r']) {
+            return None;
+        }
+        Some((text, rest))
+    }
+
+    let Some((_, rest)) = span(raw.trim()) else {
+        return false;
+    };
+    let Some((path, mut rest)) = rest.strip_prefix(" \u{b7} ").and_then(span) else {
+        return false;
+    };
+    if !(path == "~" || path.starts_with("~/") || path.starts_with('/'))
+        || path.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    // One optional session-name segment, wholly truecolor like the identity.
+    if let Some(session) = rest.strip_prefix(" \u{b7} ") {
+        let Some((_, tail)) = span(session) else {
+            return false;
+        };
+        rest = tail;
+    }
+    if rest.is_empty() {
+        return true;
+    }
+    let warning = rest.trim_start_matches(' ');
+    if rest.len() - warning.len() < 2 {
+        return false;
+    }
+    let Some((count, tail)) = warning.strip_prefix("\u{26a0} ").and_then(span) else {
+        return false;
+    };
+    let Some(count) = count
+        .strip_suffix(" warning")
+        .or_else(|| count.strip_suffix(" warnings"))
+    else {
+        return false;
+    };
+    if count.is_empty() || !count.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    tail.is_empty() || tail == " \u{b7} \u{1b}[1mf2\u{1b}[0m to view"
 }
 
 /// A broad diagnostic only: a path-bearing middle-dot row near the composer
@@ -15848,6 +15917,11 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                     "status",
                 )
                 .await;
+            } else {
+                tracing::info!(session = %name,
+                    composer_typed = composer_state(&pane).typed().is_some(),
+                    codex_footer_chrome = pane.lines().any(|raw| codex_model_footer_chrome(raw, &strip_ansi(raw))),
+                    "stuck composer stamp cleared — sweep no longer detects idle unsubmitted text");
             }
         }
 
@@ -32377,6 +32451,107 @@ mod composer_state_tests {
             composer_state(unstyled).typed(),
             Some("gpt-5.6-solxhigh\u{b7}~/Dev/amux\u{b7}Main[default]")
         );
+    }
+
+    #[test]
+    fn captured_codex_truecolor_footers_are_chrome() {
+        for frame in [
+            include_str!("../../tests/fixtures/composer/2026-10-12/worker-astra-idle.txt"),
+            include_str!("../../tests/fixtures/composer/2026-10-12/worker-sol-idle.txt"),
+            include_str!("../../tests/fixtures/composer/2026-10-12/reviewer-astra-idle.txt"),
+            include_str!("../../tests/fixtures/composer/2026-10-12/producer-working.txt"),
+        ] {
+            assert_eq!(
+                composer_state(frame),
+                ComposerState::Placeholder("AskCodextodoanything".into())
+            );
+            let footer = frame.lines().find(|l| l.contains(" warning")).unwrap();
+            assert!(codex_model_footer_chrome(footer, &strip_ansi(footer)));
+            assert!(
+                !possible_codex_footer_chrome(footer),
+                "proven chrome is not drift"
+            );
+
+            // Replace only the prompt's dim placeholder. Real input above the
+            // identical footer must remain pending, including in the active frame.
+            let typed = frame.replace(
+                "\u{1b}[2mAsk Codex to do anything\u{1b}[0m",
+                "ship the current task",
+            );
+            assert_eq!(
+                composer_state(&typed),
+                ComposerState::Typed("shipthecurrenttask".into())
+            );
+        }
+    }
+
+    #[test]
+    fn truecolor_footer_requires_the_complete_raw_painting() {
+        let frame = include_str!("../../tests/fixtures/composer/2026-10-12/worker-astra-idle.txt");
+        let footer = frame.lines().find(|l| l.contains(" warning")).unwrap();
+        let prompt = "\u{1b}[1m\u{203a}\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n";
+        for unknown in [
+            strip_ansi(footer),
+            footer.replace("\u{1b}[38;2;246;226;183m", ""),
+            footer.replace("\u{1b}[38;2;171;223;167m", ""),
+            footer.replace("\u{1b}[38;2;196;167;103m", ""),
+            footer.replace("\u{1b}[39m", ""),
+            footer.replacen(" \u{b7} ", " \u{1b}[2m\u{b7}\u{1b}[0m ", 1),
+            footer.replace("\u{1b}[1mf2\u{1b}[0m", "f2"),
+            footer.replace("38;2;246;226;183", "38;2;999;226;183"),
+            footer.replace("38;2;246;226;183", "38;2;+1;226;183"),
+            format!("{footer} actual pending continuation"),
+            format!("{footer} \u{b7} \u{1b}[38;2;1;2;3munknown segment\u{1b}[39m"),
+        ] {
+            assert!(
+                !codex_model_footer_chrome(&unknown, &strip_ansi(&unknown)),
+                "unknown painting: {unknown:?}"
+            );
+            assert!(
+                possible_codex_footer_chrome(&unknown),
+                "drift must reach the stuck-composer WARN/event"
+            );
+            assert!(matches!(
+                composer_state(&format!("{prompt}{unknown}\n")),
+                ComposerState::Typed(_)
+            ));
+        }
+
+        // No model/version/palette allowlist: rename the identity and vary its
+        // RGB channels (including SGR-like 0/2/22) without changing the proof.
+        let renamed = frame
+            .replace("GPT-6-Astra high", "future-provider arbitrary-effort")
+            .replace("38;2;246;226;183", "38;2;0;2;22");
+        assert_eq!(composer_state(&renamed).typed(), None);
+    }
+
+    #[test]
+    fn truecolor_footer_optional_segments_still_need_span_proof() {
+        let head =
+            "\u{1b}[38;2;1;2;3mfuture-model effort\u{1b}[39m \u{b7} \u{1b}[38;2;4;5;6m~/work\u{1b}[39m";
+        let session = " \u{b7} \u{1b}[38;2;7;8;9mSession name\u{1b}[39m";
+        let warning = "    \u{26a0} \u{1b}[38;2;10;11;12m2 warnings\u{1b}[39m";
+        for footer in [
+            head.to_string(),
+            format!("{head}{session}"),
+            format!("{head}{warning}"),
+            format!("{head}{session}{warning}"),
+        ] {
+            assert!(
+                codex_model_footer_chrome(&footer, &strip_ansi(&footer)),
+                "{footer:?}"
+            );
+        }
+        for footer in [
+            format!("{head} \u{b7} plain session"),
+            format!("{head}    \u{26a0} plain warning"),
+            format!("{head}{session} plain tail"),
+        ] {
+            assert!(
+                !codex_model_footer_chrome(&footer, &strip_ansi(&footer)),
+                "{footer:?}"
+            );
+        }
     }
 
     #[test]
